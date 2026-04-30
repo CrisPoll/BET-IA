@@ -1,7 +1,7 @@
 """
 Analizador de Value Betting usando DeepSeek via OpenRouter.
 
-Toma los datos de un partido (desde BSD) y las predicciones ML,
+Toma los datos de un partido (desde BSD + SofaScore) y las predicciones ML,
 los envía a DeepSeek para obtener un análisis experto de value betting.
 """
 
@@ -11,14 +11,10 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from sofascore_client import (
     _formatear_alineaciones_para_prompt,
-    _formatear_stats_sofascore_para_prompt,
-    _formatear_standings_para_prompt,
     _formatear_h2h_sofascore_para_prompt,
-    _formatear_top_jugadores_para_prompt,
     _formatear_detalle_evento_para_prompt,
+    _formatear_form_performance_para_prompt,
 )
-from odds_client import _formatear_odds_para_prompt
-from score365_client import _formatear_stats_365_para_prompt
 
 load_dotenv()
 
@@ -26,8 +22,8 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 MODEL_NAME = "deepseek/deepseek-v4-pro"
-MAX_TOKENS = 32000  # Holgado: ~3000 razonamiento + ~5000 respuesta visible + margen
-TEMPERATURE = 0.3  # Baja temperatura para análisis más consistente
+MAX_TOKENS = 32000
+TEMPERATURE = 0.3
 
 SYSTEM_PROMPT = """Eres un experto analista de Value Betting en fútbol, con mentalidad crítica y escéptica ante datos imperfectos.
 
@@ -47,21 +43,17 @@ REGLAS DE PONDERACIÓN OBLIGATORIAS:
 - El H2H es solo una referencia secundaria. Si el H2H contradice la forma actual, ignóralo.
 - Los partidos de H2H de más de 3 años atrás son irrelevantes (plantillas y estilos cambiaron).
 - Si el H2H proviene de Champions League pero los equipos nunca se enfrentaron con estas plantillas, dale peso BAJO.
-- STANDINGS (SofaScore): La tabla de posiciones actual es un indicador fuerte de rendimiento REAL en la temporada.
-- RATINGS SOFASCORE: El rating promedio de equipo y los top jugadores reflejan calidad individual. Un equipo con rating alto + top jugadores en buen momento tiene ventaja cualitativa real.
-- LESIONES/SUSPENSIONES (SofaScore): Son la fuente autoritativa de bajas. Si SofaScore reporta un jugador lesionado/suspendido, NO esta disponible.
+- LESIONES/SUSPENSIONES (BSD): Los datos de bajas vienen de BSD. Usalos como REFERENCIA pero con PRECAUCION: BSD no siempre es preciso. Si un jugador aparece como lesionado en BSD pero SofaScore lo pone titular, SofaScore MANDA → el jugador JUEGA.
 - ARBITRO (SofaScore): Si SofaScore trae arbitro, usalo como referencia principal (reemplaza al de BSD).
 
 REGLAS DE REMATES (TIROS):
-- La fuente principal son las estadisticas de SofaScore (remates_promedio_sf, remates_arco_promedio_sf). Si estan disponibles, USALAS como base.
-- Como fallback, usa remates_promedio y remates_arco_promedio de BSD (en la seccion FORMA).
+- La fuente principal son los promedios de BSD en la seccion FORMA (remates_promedio, remates_arco_promedio).
 - Equipos con alto xG + alto volumen de remates al arco → partido intenso ofensivamente.
 - Si ambos equipos promedian >10 remates y >4 al arco → Over 2.5 gana peso adicional.
 - Si ambos equipos generan pocos remates al arco (<3) → Under 2.5 gana peso.
 
 REGLAS DE TARJETAS Y ÁRBITRO:
-- La fuente principal para amarillas son las estadisticas de SofaScore (amarillas_promedio_sf). Como fallback, usa amarillas_promedio de BSD.
-- Usa amarillas_promedio y faltas_promedio de cada equipo como base.
+- La fuente principal para amarillas son los promedios de BSD (amarillas_promedio, faltas_promedio).
 - Si el árbitro tiene fama de "tarjetero" (promedio alto de amarillas por partido), aumenta la proyeccion.
 - Derbis y partidos de alta rivalidad → mas tarjetas esperadas.
 - Partidos con poco en juego (mitad de tabla, sin descenso) → menos tarjetas.
@@ -71,7 +63,8 @@ REGLAS DE ALINEACIONES / DISPONIBILIDAD DE JUGADORES:
 - LA ALINEACION DE SOFASCORE ES LA FUENTE UNICA Y DEFINITIVA de que jugadores juegan.
 - Si SofaScore tiene alineacion confirmada: esos son EXACTAMENTE los jugadores que jugaran. No asumas ausencias adicionales.
 - Si SofaScore NO tiene alineacion (suele salir ~1h antes del partido): asume la plantilla tipo con los jugadores habituales disponibles.
-- NO uses datos de "bajas" o "lesiones" de BSD. Esa fuente ya NO se utiliza porque era frecuentemente erronea.
+- Las BAJAS BSD (lesionados/suspendidos) son una referencia SECUNDARIA. Si BSD dice que X esta lesionado pero SofaScore lo pone titular, SofaScore MANDA: X JUEGA.
+- Si un jugador NO aparece en la alineacion de SofaScore y BSD lo reporta como lesionado, probablemente sea baja real.
 - Si no hay informacion de bajas/ausencias confiable, NO inventes debilidad ofensiva para justificar unders o BTTS No.
 
 REGLAS DE OVERCONFIDENCE:
@@ -114,13 +107,12 @@ Si hay contexto favorable para tiros/amarillas/corners, menciónalo como nota ad
 
 
 
-
 def _crear_prompt_usuario(datos_resumidos: dict, prediccion_resumida: dict) -> str:
     """
     Construye el prompt de usuario con los datos del partido formateados.
 
     Args:
-        datos_resumidos: Datos resumidos del partido desde bsd_client.
+        datos_resumidos: Datos resumidos del partido desde bsd_client + sofascore_client.
         prediccion_resumida: Predicción ML resumida desde bsd_client.
 
     Returns:
@@ -138,7 +130,6 @@ Fecha: {datos_resumidos.get('fecha', 'Desconocida')}
 {f"Nombre: {datos_resumidos['arbitro'].get('nombre', 'Desconocido')} ({datos_resumidos['arbitro'].get('nacionalidad', '?')})" if datos_resumidos.get('arbitro') else "ARBITRO NO ASIGNADO. No asumas nada sobre su estilo; simplemente omite el factor arbitral."}
 
 ### CUOTAS DEL BOOKMAKER
-{"NOTA: Cuotas actualizadas en tiempo real via The Odds API (no BSD)." if datos_resumidos.get("cuotas", {}).get("_fuente") == "the-odds-api" else "NOTA: Cuotas desde BSD API. Pueden tener desfase de horas."}
 - Local: {datos_resumidos['cuotas'].get('local', 'N/D')}
 - Empate: {datos_resumidos['cuotas'].get('empate', 'N/D')}
 - Visitante: {datos_resumidos['cuotas'].get('visitante', 'N/D')}
@@ -155,19 +146,27 @@ Fecha: {datos_resumidos.get('fecha', 'Desconocida')}
 
 ### HEAD TO HEAD (últimos 3 años)
 - NOTA: Solo se muestran enfrentamientos recientes. El H2H antiguo (>3 años) fue excluido porque las plantillas y estilos cambiaron.
-- BSD: {json.dumps(datos_resumidos.get('h2h', {}), indent=2, ensure_ascii=False)}
+{f"- {json.dumps(datos_resumidos.get('h2h', {}), indent=2, ensure_ascii=False)}" if datos_resumidos.get('h2h') and datos_resumidos['h2h'].get('total_partidos') else "- No hay enfrentamientos previos registrados entre estos equipos. Ignora el factor H2H para este analisis."}
 
 ### NOTA SOBRE DATOS DISPONIBLES
-- REMATES Y TIROS: La fuente principal son las estadisticas de SofaScore (remates_promedio_sf, remates_arco_promedio_sf) en la seccion ESTADISTICAS DE EQUIPO abajo. Si no estan disponibles, usa los promedios de BSD en FORMA como fallback.
-- AMARILLAS: Igual que remates — prefiere SofaScore (amarillas_promedio_sf). Cruza esto con la info del arbitro.
-- CORNERS: SofaScore puede tener corners_promedio_sf. Si esta disponible, usalo como base. Si no, haz una inferencia cualitativa basada en estilo de juego.
-- POSESION: Si SofaScore trae posesion_promedio_sf, usala para evaluar dominio territorial. Equipos con alta posesion tienden a generar mas corners ofensivos.
+- REMATES Y TIROS: Usa los promedios de BSD en la seccion FORMA (remates_promedio, remates_arco_promedio).
+- AMARILLAS: Usa amarillas_promedio y faltas_promedio de BSD. Cruza esto con la info del arbitro.
+- CORNERS: BSD no proporciona corners. Haz una inferencia cualitativa basada en estilo de juego y posesion.
+- POSESION: Infiere del estilo de juego y perfil de los entrenadores.
+- LESIONES: SofaScore YA NO proporciona datos de lesiones via API. Usa BAJAS BSD como referencia secundaria con PRECAUCION. La alineacion de SofaScore es quien define quien JUEGA.
 
 ### ALINEACION DEL PARTIDO (SofaScore)
-- La alineacion de SofaScore es la unica fuente de disponibilidad de jugadores. No uses datos de bajas de BSD.
+- La alineacion de SofaScore es la unica fuente de disponibilidad de jugadores.
+- Si hay CONFLICTOS BSD vs SofaScore, SofaScore MANDA (el jugador JUEGA).
 {f"### ALINEACION CONFIRMADA (SofaScore)\n- {json.dumps(datos_resumidos.get('_sofascore', {}).get('alineaciones', {}), indent=2, ensure_ascii=False)}" if datos_resumidos.get("_sofascore", {}).get("alineaciones", {}).get("local", {}).get("confirmada") else ""}
 {f"### ALINEACION PRELIMINAR (NO CONFIRMADA)\n- {json.dumps(datos_resumidos.get('_sofascore', {}).get('alineaciones', {}), indent=2, ensure_ascii=False)}" if datos_resumidos.get("_sofascore", {}).get("alineaciones") and not datos_resumidos.get("_sofascore", {}).get("alineaciones", {}).get("local", {}).get("confirmada") else ""}
 {f"### SIN ALINEACION DISPONIBLE\n- SofaScore no tiene alineacion todavia (suele salir ~1h antes del partido). Asume plantilla tipo con los jugadores habituales." if not datos_resumidos.get("_sofascore", {}).get("alineaciones") else ""}
+
+### BAJAS BSD (lesionados/suspendidos - referencia secundaria)
+{json.dumps(datos_resumidos.get('bajas_bsd', {}), indent=2, ensure_ascii=False)}
+- NOTA: Estas bajas son de BSD, NO de SofaScore. Usalas con precaucion.
+- Si un jugador esta aqui Y NO en la alineacion de SofaScore → probable baja real.
+- Si un jugador esta aqui Y SI en la alineacion de SofaScore → JUEGA (conflicto resuelto a favor de SofaScore).
 
 ### ESTILOS DE ENTRENADORES
 - Local: {json.dumps(datos_resumidos.get('entrenador_local', {}), indent=2, ensure_ascii=False)}
@@ -185,13 +184,9 @@ Fecha: {datos_resumidos.get('fecha', 'Desconocida')}
 Analiza los datos anteriores y proporciona tu evaluación de value betting siguiendo el formato establecido.
 
 {_formatear_detalle_evento_para_prompt(datos_resumidos)}
-{_formatear_standings_para_prompt(datos_resumidos)}
 {_formatear_h2h_sofascore_para_prompt(datos_resumidos)}
-{_formatear_top_jugadores_para_prompt(datos_resumidos)}
 {_formatear_alineaciones_para_prompt(datos_resumidos)}
-{_formatear_stats_sofascore_para_prompt(datos_resumidos)}
-{_formatear_stats_365_para_prompt(datos_resumidos)}
-{_formatear_odds_para_prompt(datos_resumidos)}
+{_formatear_form_performance_para_prompt(datos_resumidos)}
 """
     return prompt
 

@@ -379,7 +379,7 @@ def resumir_datos_partido(evento: dict) -> dict:
     if isinstance(referee, dict):
         resumen["arbitro"] = {
             "nombre": referee.get("name"),
-            "nacionalidad": referee.get("country"),
+            "nacionalidad": referee.get("nationality"),
             "id": referee.get("id"),
         }
     elif isinstance(referee, str) and referee.strip():
@@ -395,13 +395,6 @@ def resumir_datos_partido(evento: dict) -> dict:
             "ciudad": venue.get("city"),
             "capacidad": venue.get("capacity"),
         }
-
-    # Bajas de BSD (para deteccion de conflictos con SofaScore)
-    bajas_raw = evento.get("unavailable_players") or {}
-    resumen["bajas_bsd"] = {
-        "local": _clasificar_bajas(bajas_raw.get("home", [])),
-        "visitante": _clasificar_bajas(bajas_raw.get("away", [])),
-    }
 
     return resumen
 

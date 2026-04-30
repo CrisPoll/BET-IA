@@ -1,4 +1,4 @@
-from sofascore_client import _normalizar_nombre
+from utils import normalizar_nombre
 
 print('=== Normalización corregida ===')
 tests = [
@@ -12,25 +12,22 @@ tests = [
     ('Manchester City', 'Manchester United', False),
 ]
 for a, b, expected in tests:
-    na = _normalizar_nombre(a)
-    nb = _normalizar_nombre(b)
+    na = normalizar_nombre(a)
+    nb = normalizar_nombre(b)
     result = na == nb
     status = '✓' if result == expected else '✗'
     print(f'  {status} "{a}" → "{na}" vs "{b}" → "{nb}" = {result} (esperado: {expected})')
 
-print('\n=== Prueba de conexión curl_cffi (sin hacer request real) ===')
+print('\n=== Import de apifootball_client ===')
 try:
-    from curl_cffi import requests as cffi_requests
-    print('  ✓ curl_cffi importado')
-    print('  Creando sesión con impersonate="chrome"...')
-    session = cffi_requests.Session(impersonate="chrome")
-    print('  ✓ Sesión creada')
+    from apifootball_client import obtener_datos_completos_partido, obtener_proximos_partidos
+    print('  ✓ apifootball_client importado correctamente')
 except Exception as e:
     print(f'  ✗ Error: {e}')
 
-print('\n=== Import de odds_client ===')
+print('\n=== Import de analyzer ===')
 try:
-    from odds_client import enriquecer_cuotas, _formatear_odds_para_prompt
-    print('  ✓ odds_client importado correctamente')
+    from analyzer import analizar_partido
+    print('  ✓ analyzer importado correctamente')
 except Exception as e:
     print(f'  ✗ Error: {e}')

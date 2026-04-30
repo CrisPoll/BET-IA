@@ -6,6 +6,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+BSD_API_KEY = os.getenv("BSD_API_KEY")
+
+_REQUIRED_VARS = {
+    "DISCORD_BOT_TOKEN": DISCORD_BOT_TOKEN,
+    "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
+    "BSD_API_KEY": BSD_API_KEY,
+}
+
+_missing = [k for k, v in _REQUIRED_VARS.items() if not v]
+if _missing:
+    raise ValueError(
+        f"Variables de entorno faltantes en .env: {', '.join(_missing)}. "
+        "Completa el archivo .env basado en .env.example"
+    )
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -24,11 +39,6 @@ async def on_ready():
 
 
 if __name__ == "__main__":
-    if not DISCORD_BOT_TOKEN:
-        raise ValueError(
-            "DISCORD_BOT_TOKEN no configurada en .env. "
-            "Crea un bot en https://discord.com/developers/applications"
-        )
     bot.load_extension("cogs.betting")
     print(f"Comandos antes de run: {[c.name for c in bot.commands]}")
     bot.run(DISCORD_BOT_TOKEN)

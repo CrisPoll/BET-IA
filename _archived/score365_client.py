@@ -10,10 +10,11 @@ Endpoints probados (mejor esfuerzo, pueden cambiar):
 """
 
 import time
-import unicodedata
 from datetime import datetime
 
 from dotenv import load_dotenv
+
+from utils import normalizar_nombre
 
 load_dotenv()
 
@@ -49,26 +50,6 @@ def _crear_sesion():
     return session
 
 
-def _normalizar_nombre(nombre: str) -> str:
-    """Normaliza nombre de equipo para matching (misma logica que SofaScore)."""
-    if not nombre:
-        return ""
-    import re
-    n = unicodedata.normalize("NFKD", nombre)
-    n = "".join(c for c in n if not unicodedata.combining(c))
-    n = n.lower().strip()
-    for s in [" fc", " cf", " sc", " ac", " afc"]:
-        if n.endswith(s) and len(n) - len(s) >= 5:
-            n = n[:-len(s)].strip()
-            break
-    for p in ["fc ", "cf ", "sc ", "ac "]:
-        if n.startswith(p):
-            n = n[len(p):].strip()
-            break
-    n = re.sub(r"\s+", " ", n)
-    return n
-
-
 def _buscar_partido(session, fecha_str: str, home_team: str, away_team: str) -> dict | None:
     """
     Busca un partido en 365score por fecha y equipos.
@@ -93,8 +74,8 @@ def _buscar_partido(session, fecha_str: str, home_team: str, away_team: str) -> 
     except (IndexError, TypeError):
         return None
 
-    home_norm = _normalizar_nombre(home_team)
-    away_norm = _normalizar_nombre(away_team)
+    home_norm = normalizar_nombre(home_team)
+    away_norm = normalizar_nombre(away_team)
 
     # Intentar endpoint de busqueda por fecha
     try:
@@ -113,8 +94,8 @@ def _buscar_partido(session, fecha_str: str, home_team: str, away_team: str) -> 
             matches.extend(comp.get("games") or comp.get("matches") or [])
 
     for m in matches:
-        m_home = _normalizar_nombre(m.get("homeCompetitor", {}).get("name") or m.get("homeName", ""))
-        m_away = _normalizar_nombre(m.get("awayCompetitor", {}).get("name") or m.get("awayName", ""))
+        m_home = normalizar_nombre(m.get("homeCompetitor", {}).get("name") or m.get("homeName", ""))
+        m_away = normalizar_nombre(m.get("awayCompetitor", {}).get("name") or m.get("awayName", ""))
         if (home_norm in m_home or m_home in home_norm) and (away_norm in m_away or m_away in away_norm):
             return m
 

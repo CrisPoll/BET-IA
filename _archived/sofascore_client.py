@@ -256,81 +256,54 @@ def _extraer_performance(data: dict, team_id: int) -> dict:
 
 
 def _extraer_h2h_sofascore(h2h_data: dict) -> dict:
-    """
-    Extrae head-to-head desde SofaScore.
-    Formato nuevo (post-cambio): {"teamDuel": {homeWins, awayWins, draws}, "managerDuel": {...}}
-    Formato antiguo (pre-cambio):  {"events": [...]}
-    """
-    # Nuevo formato
-    td = h2h_data.get("teamDuel")
-    if td:
-        total = td.get("homeWins", 0) + td.get("awayWins", 0) + td.get("draws", 0)
-        return {
-            "total_partidos": total,
-            "victorias_local": td.get("homeWins", 0),
-            "empates": td.get("draws", 0),
-            "victorias_visitante": td.get("awayWins", 0),
-            "goles_local": None,
-            "goles_visitante": None,
-            "promedio_goles": None,
-            "ultimos_enfrentamientos": [],
-            "_formato_h2h": "nuevo (teamDuel resumido)",
-        }
-
-    # Formato antiguo (por si vuelve)
     events = h2h_data.get("events", [])
-    if events:
-        total = len(events)
-        vic_local = sum(1 for e in events
-                        if e.get("homeScore", {}).get("current", 0) is not None
-                        and e.get("awayScore", {}).get("current", 0) is not None
-                        and e["homeScore"]["current"] > e["awayScore"]["current"])
-        vic_visit = sum(1 for e in events
-                        if e.get("homeScore", {}).get("current", 0) is not None
-                        and e.get("awayScore", {}).get("current", 0) is not None
-                        and e["awayScore"]["current"] > e["homeScore"]["current"])
-        empates = total - vic_local - vic_visit
-        goles_local = sum(e.get("homeScore", {}).get("current", 0) or 0 for e in events)
-        goles_visit = sum(e.get("awayScore", {}).get("current", 0) or 0 for e in events)
+    if not events:
+        return {}
 
-        enfrentamientos = []
-        for e in events[:10]:
-            home = e.get("homeTeam", {}).get("name", "?")
-            away = e.get("awayTeam", {}).get("name", "?")
-            hs = e.get("homeScore", {}).get("current", 0)
-            as_ = e.get("awayScore", {}).get("current", 0)
-            ts = e.get("startTimestamp", 0)
-            fecha = ""
-            if ts:
-                from datetime import datetime as dt
-                fecha = dt.fromtimestamp(ts).strftime("%d/%m/%Y")
-            enfrentamientos.append(f"{fecha}: {home} {hs}-{as_} {away}" if fecha else f"{home} {hs}-{as_} {away}")
+    total = len(events)
+    vic_local = sum(1 for e in events
+                    if e.get("homeScore", {}).get("current", 0) is not None
+                    and e.get("awayScore", {}).get("current", 0) is not None
+                    and e["homeScore"]["current"] > e["awayScore"]["current"])
+    vic_visit = sum(1 for e in events
+                    if e.get("homeScore", {}).get("current", 0) is not None
+                    and e.get("awayScore", {}).get("current", 0) is not None
+                    and e["awayScore"]["current"] > e["homeScore"]["current"])
+    empates = total - vic_local - vic_visit
+    goles_local = sum(e.get("homeScore", {}).get("current", 0) or 0 for e in events)
+    goles_visit = sum(e.get("awayScore", {}).get("current", 0) or 0 for e in events)
 
-        return {
-            "total_partidos": total,
-            "victorias_local": vic_local,
-            "empates": empates,
-            "victorias_visitante": vic_visit,
-            "goles_local": goles_local,
-            "goles_visitante": goles_visit,
-            "promedio_goles": round((goles_local + goles_visit) / total, 2) if total else 0,
-            "ultimos_enfrentamientos": enfrentamientos,
-            "_formato_h2h": "antiguo (events detallado)",
-        }
+    enfrentamientos = []
+    for e in events[:5]:
+        home = e.get("homeTeam", {}).get("name", "?")
+        away = e.get("awayTeam", {}).get("name", "?")
+        hs = e.get("homeScore", {}).get("current", 0)
+        as_ = e.get("awayScore", {}).get("current", 0)
+        ts = e.get("startTimestamp", 0)
+        fecha = ""
+        if ts:
+            from datetime import datetime as dt
+            fecha = dt.fromtimestamp(ts).strftime("%d/%m/%Y")
+        enfrentamientos.append(f"{fecha}: {home} {hs}-{as_} {away}" if fecha else f"{home} {hs}-{as_} {away}")
 
-    return {}
+    return {
+        "total_partidos": total,
+        "victorias_local": vic_local,
+        "empates": empates,
+        "victorias_visitante": vic_visit,
+        "goles_local": goles_local,
+        "goles_visitante": goles_visit,
+        "promedio_goles": round((goles_local + goles_visit) / total, 2) if total else 0,
+        "ultimos_enfrentamientos": enfrentamientos,
+    }
 
 
 def _extraer_info_evento_detalle(evento_detalle: dict) -> dict:
     """
-    Extrae arbitro y managers desde el detalle del evento.
-
-    NOTA: SofaScore retiro injuredPlayers/suspendedPlayers de este endpoint.
-    Las lesiones ahora vienen de BSD como fuente secundaria.
-    Las alineaciones de SofaScore siguen siendo autoritativas para quien JUEGA.
+    Extrae arbitro, managers, suplentes nombrados, lesiones desde el detalle del evento.
 
     Returns:
-        Dict con {arbitro, manager_local, manager_visitante}.
+        Dict con {arbitro, manager_local, manager_visitante, lesiones}.
     """
     resultado = {}
 
@@ -348,6 +321,22 @@ def _extraer_info_evento_detalle(evento_detalle: dict) -> dict:
     away_manager = evento_detalle.get("awayTeam", {}).get("manager", {})
     if away_manager and away_manager.get("name"):
         resultado["manager_visitante"] = {"nombre": away_manager.get("name")}
+
+    # Lesiones y suspensiones desde los datos de equipo
+    lesiones = []
+    for lado, key in [("local", "homeTeam"), ("visitante", "awayTeam")]:
+        team_info = evento_detalle.get(key, {})
+        injured = team_info.get("injuredPlayers", [])
+        suspended = team_info.get("suspendedPlayers", [])
+        for p in injured:
+            name = p.get("player", p).get("name", p.get("shortName", "?"))
+            lesiones.append({"equipo": lado, "jugador": name, "tipo": "lesion"})
+        for p in suspended:
+            name = p.get("player", p).get("name", p.get("shortName", "?"))
+            lesiones.append({"equipo": lado, "jugador": name, "tipo": "suspension"})
+
+    if lesiones:
+        resultado["lesiones"] = lesiones
 
     return resultado
 
@@ -517,7 +506,6 @@ def _formatear_form_performance_para_prompt(datos: dict) -> str:
 def _formatear_h2h_sofascore_para_prompt(datos: dict) -> str:
     """
     Formatea H2H de SofaScore para el prompt.
-    Soporta formato nuevo (teamDuel resumido) y antiguo (events detallado).
     """
     sofas = datos.get("_sofascore", {})
     if not sofas.get("disponible"):
@@ -526,22 +514,18 @@ def _formatear_h2h_sofascore_para_prompt(datos: dict) -> str:
     if not h2h:
         return ""
 
-    partes = ["\n### H2H SOFASCORE"]
+    partes = ["\n### H2H SOFASCORE (detalle completo)"]
     partes.append(f"- Total partidos: {h2h.get('total_partidos', '?')} | "
                   f"Local: {h2h.get('victorias_local', 0)}V | "
                   f"Empates: {h2h.get('empates', 0)} | "
                   f"Visitante: {h2h.get('victorias_visitante', 0)}V")
-
-    if h2h.get("goles_local") is not None and h2h.get("goles_visitante") is not None:
-        partes.append(f"- Goles: Local {h2h.get('goles_local', '?')} - Visitante {h2h.get('goles_visitante', '?')} | "
-                      f"Promedio: {h2h.get('promedio_goles', '?')}")
-    else:
-        partes.append("- NOTA: H2H en formato resumido (sin detalle de goles ni fechas). Usa los totales W/D/L como referencia.")
+    partes.append(f"- Goles: Local {h2h.get('goles_local', '?')} - Visitante {h2h.get('goles_visitante', '?')} | "
+                  f"Promedio: {h2h.get('promedio_goles', '?')}")
 
     ultimos = h2h.get("ultimos_enfrentamientos", [])
     if ultimos:
-        partes.append("\nUltimos enfrentamientos:")
-        for u in ultimos[:10]:
+        partes.append("\nÚltimos enfrentamientos:")
+        for u in ultimos:
             partes.append(f"  {u}")
 
     return "\n".join(partes)
@@ -573,61 +557,16 @@ def _formatear_detalle_evento_para_prompt(datos: dict) -> str:
         if detalle.get("manager_visitante"):
             partes.append(f"Manager {away_team}: {detalle['manager_visitante'].get('nombre', '?')}")
 
-    # NOTA: SofaScore ya no expone lesiones via API (endpoint removido).
-    # Las lesiones ahora vienen de BSD (seccion BAJAS BSD en el prompt).
-    # Las alineaciones de SofaScore siguen siendo autoritativas para quien JUEGA.
-    partes.append("\n**NOTA SOBRE LESIONES**: SofaScore ya no proporciona datos de lesiones via API.")
-    partes.append("Usa los datos de BAJAS BSD como referencia de lesionados/suspendidos, pero con PRECAUCION.")
-    partes.append("La ALINEACION de SofaScore es la unica fuente confiable de quien JUEGA.")
-
-    # Detectar conflictos BSD vs SofaScore
-    conflictos = _detectar_conflictos(datos, detalle)
-    if conflictos:
-        partes.append("\n**\u26a0\ufe0f CONFLICTOS BSD vs SofaScore:**")
-        partes.append("Los siguientes jugadores aparecen como lesionados/suspendidos en BSD pero estan en la alineacion titular de SofaScore.")
-        partes.append("Como SofaScore es la fuente autoritativa, asume que SI juegan. Pero ten en cuenta que pueden no estar al 100%:")
-        for c in conflictos:
-            partes.append(f"  - {c['equipo']}: {c['jugador']} (BSD: {c['estado_bsd']}, SofaScore: TITULAR)")
-        partes.append("IMPORTANTE: Estos jugadores JUEGAN segun SofaScore. No los consideres bajas.")
+    if detalle.get("lesiones"):
+        partes.append("\n**Lesiones y suspensiones (SofaScore):**")
+        local_team = datos.get("partido", "").split(" vs ")[0] if " vs " in datos.get("partido", "") else "Local"
+        away_team = datos.get("partido", "").split(" vs ")[1] if " vs " in datos.get("partido", "") else "Visitante"
+        for l in detalle["lesiones"]:
+            team_name = local_team if l["equipo"] == "local" else away_team
+            partes.append(f"  - {team_name}: {l['jugador']} ({l['tipo']})")
+        partes.append("IMPORTANTE: Estas lesiones/suspensiones de SofaScore son la fuente autoritativa de bajas.")
 
     return "\n".join(partes)
-
-
-def _detectar_conflictos(datos: dict, detalle: dict) -> list:
-    """Compara bajas de BSD contra alineacion de SofaScore y detecta conflictos."""
-    bajas_bsd = datos.get("bajas_bsd", {})
-    alin = (datos.get("_sofascore") or {}).get("alineaciones") or {}
-    if not bajas_bsd or not alin:
-        return []
-
-    local_team_name = datos.get("partido", "").split(" vs ")[0] if " vs " in datos.get("partido", "") else "Local"
-    away_team_name = datos.get("partido", "").split(" vs ")[1] if " vs " in datos.get("partido", "") else "Visitante"
-
-    conflictos = []
-
-    def _nombres_alineacion(side):
-        titulares = alin.get(side, {}).get("titulares", [])
-        suplentes = alin.get(side, {}).get("suplentes", [])
-        return {t["nombre"].lower().strip() for t in titulares + suplentes}
-
-    nombres_local = _nombres_alineacion("local")
-    nombres_visitante = _nombres_alineacion("visitante")
-
-    for lado, side_key, team_name in [("local", "local", local_team_name), ("visitante", "visitante", away_team_name)]:
-        side_bajas = bajas_bsd.get(side_key, {})
-        confirmadas = side_bajas.get("confirmadas", [])
-        alin_nombres = nombres_local if lado == "local" else nombres_visitante
-
-        for baja in confirmadas:
-            nombre_baja = baja["nombre"].lower().strip()
-            if nombre_baja in alin_nombres:
-                conflictos.append({
-                    "equipo": team_name,
-                    "jugador": baja["nombre"],
-                    "estado_bsd": baja.get("estado", "?"),
-                })
-
-    return conflictos
 
 
 def _formatear_alineaciones_para_prompt(datos: dict) -> str:
@@ -670,216 +609,3 @@ def _formatear_alineaciones_para_prompt(datos: dict) -> str:
 
     partes.append("\nIMPORTANTE: Esta es la alineacion oficial. Los jugadores listados aqui SON los que juegan. No asumas bajas adicionales de otras fuentes.")
     return "\n".join(partes)
-
-
-def verificar_salud_sofascore(detallado: bool = True) -> dict:
-    """
-    Verifica que los endpoints de SofaScore sigan accesibles y con la estructura esperada.
-
-    Prueba cada endpoint usado por el sistema contra un partido real de hoy.
-    Si algun endpoint cambio URL, devuelve 4xx/5xx o cambio su schema JSON,
-    lo reporta como fallo.
-
-    Args:
-        detallado: Si True, imprime el resultado a consola.
-
-    Returns:
-        Dict con status general y detalle por endpoint:
-        {
-            "ok": bool,
-            "endpoints": {
-                "scheduled_events": {"ok": bool, "error": str|None, "campos_ok": bool},
-                "event_detail":     {...},
-                "lineups":          {...},
-                "performance":      {...},
-                "h2h":              {...},
-            }
-        }
-    """
-    resultado = {"ok": True, "endpoints": {}}
-    hoy = datetime.now().strftime("%Y-%m-%d")
-
-    try:
-        session = _crear_sesion_sofascore()
-    except ImportError as e:
-        resultado["ok"] = False
-        resultado["error"] = f"curl_cffi no instalado: {e}"
-        if detallado:
-            print(f"\n  SOFASCORE HEALTH: FAIL - {resultado['error']}")
-        return resultado
-    except Exception as e:
-        resultado["ok"] = False
-        resultado["error"] = f"No se pudo crear sesion: {e}"
-        if detallado:
-            print(f"\n  SOFASCORE HEALTH: FAIL - {resultado['error']}")
-        return resultado
-
-    # ── 1. Scheduled events ──
-    ep = {"ok": True, "error": None, "campos_ok": True}
-    try:
-        url = f"{SOFASCORE_API}/sport/football/scheduled-events/{hoy}"
-        resp = session.get(url, timeout=15)
-        if resp.status_code != 200:
-            ep["ok"] = False
-            ep["error"] = f"HTTP {resp.status_code}"
-        else:
-            data = resp.json()
-            events = data.get("events", [])
-            if not events:
-                ep["error"] = "Sin eventos hoy (puede ser normal)"
-            else:
-                ev = events[0]
-                if not ev.get("homeTeam") or not ev.get("awayTeam") or not ev.get("id"):
-                    ep["campos_ok"] = False
-                    ep["error"] = "Estructura del evento cambio (falta homeTeam/awayTeam/id)"
-    except Exception as e:
-        ep["ok"] = False
-        ep["error"] = str(e)[:100]
-    resultado["endpoints"]["scheduled_events"] = ep
-    if not ep["ok"]:
-        resultado["ok"] = False
-
-    # ── 2. Buscar un event_id y team_id valido ──
-    event_id = None
-    team_id = None
-    try:
-        resp = session.get(f"{SOFASCORE_API}/sport/football/scheduled-events/{hoy}", timeout=15)
-        if resp.status_code == 200:
-            events = resp.json().get("events", [])
-            if events:
-                event_id = events[0].get("id")
-                team_id = events[0].get("homeTeam", {}).get("id")
-    except Exception:
-        pass
-
-    if not event_id:
-        for ep_name in ["event_detail", "lineups", "h2h", "performance"]:
-            resultado["endpoints"][ep_name] = {
-                "ok": False, "error": "No se encontro event_id para testear", "campos_ok": False
-            }
-        if detallado:
-            _imprimir_resultado_salud(resultado)
-        return resultado
-
-    # ── 3. Event detail ──
-    ep = _testear_event_detail(session, event_id)
-    resultado["endpoints"]["event_detail"] = ep
-    if not ep["ok"]:
-        resultado["ok"] = False
-
-    # ── 4. Lineups ──
-    ep = _testear_lineups(session, event_id)
-    resultado["endpoints"]["lineups"] = ep
-    if not ep["ok"]:
-        resultado["ok"] = False
-
-    # ── 5. H2H ──
-    ep = _testear_h2h(session, event_id)
-    resultado["endpoints"]["h2h"] = ep
-    if not ep["ok"]:
-        resultado["ok"] = False
-
-    # ── 6. Performance ──
-    ep = _testear_performance(session, team_id) if team_id else {"ok": False, "error": "Sin team_id", "campos_ok": False}
-    resultado["endpoints"]["performance"] = ep
-    if not ep["ok"]:
-        resultado["ok"] = False
-
-    if detallado:
-        _imprimir_resultado_salud(resultado)
-
-    return resultado
-
-
-def _testear_event_detail(session, event_id: int) -> dict:
-    ep = {"ok": True, "error": None, "campos_ok": True}
-    try:
-        resp = session.get(f"{SOFASCORE_API}/event/{event_id}", timeout=15)
-        if resp.status_code != 200:
-            ep["ok"] = False
-            ep["error"] = f"HTTP {resp.status_code}"
-        else:
-            data = resp.json()
-            ev = data.get("event") or data
-            if not ev.get("homeTeam"):
-                ep["campos_ok"] = False
-                ep["error"] = "Falta homeTeam en event detail"
-    except Exception as e:
-        ep["ok"] = False
-        ep["error"] = str(e)[:100]
-    return ep
-
-
-def _testear_lineups(session, event_id: int) -> dict:
-    ep = {"ok": True, "error": None, "campos_ok": True}
-    try:
-        resp = session.get(f"{SOFASCORE_API}/event/{event_id}/lineups", timeout=15)
-        if resp.status_code != 200:
-            ep["ok"] = False
-            ep["error"] = f"HTTP {resp.status_code}"
-        else:
-            data = resp.json()
-            if not data.get("home") and not data.get("away"):
-                ep["campos_ok"] = False
-                ep["error"] = "Faltan home/away en lineups (posible partido sin alineacion aun)"
-            else:
-                home = data.get("home", {})
-                if home and not home.get("players"):
-                    ep["campos_ok"] = False
-                    ep["error"] = "Falta players[] en lineups/home"
-    except Exception as e:
-        ep["ok"] = False
-        ep["error"] = str(e)[:100]
-    return ep
-
-
-def _testear_h2h(session, event_id: int) -> dict:
-    ep = {"ok": True, "error": None, "campos_ok": True}
-    try:
-        resp = session.get(f"{SOFASCORE_API}/event/{event_id}/h2h", timeout=20)
-        if resp.status_code != 200:
-            ep["ok"] = False
-            ep["error"] = f"HTTP {resp.status_code}"
-        else:
-            data = resp.json()
-            if data and "teamDuel" not in data:
-                ep["campos_ok"] = False
-                ep["error"] = "Falta teamDuel en respuesta h2h (schema cambio)"
-    except Exception as e:
-        ep["ok"] = False
-        ep["error"] = str(e)[:100]
-    return ep
-
-
-def _testear_performance(session, team_id: int) -> dict:
-    ep = {"ok": True, "error": None, "campos_ok": True}
-    try:
-        resp = session.get(f"{SOFASCORE_API}/team/{team_id}/performance", timeout=15)
-        if resp.status_code != 200:
-            ep["ok"] = False
-            ep["error"] = f"HTTP {resp.status_code}"
-        else:
-            data = resp.json()
-            events = data.get("events", [])
-            if events:
-                ev = events[0]
-                if "winnerCode" not in ev or "homeScore" not in ev:
-                    ep["campos_ok"] = False
-                    ep["error"] = "Estructura de performance/events cambio (falta winnerCode/homeScore)"
-    except Exception as e:
-        ep["ok"] = False
-        ep["error"] = str(e)[:100]
-    return ep
-
-
-def _imprimir_resultado_salud(resultado: dict):
-    """Imprime el resultado del health check en consola."""
-    status_icon = "OK" if resultado["ok"] else "FAIL"
-    print(f"\n  SOFASCORE HEALTH CHECK: {status_icon}")
-    for name, ep in resultado.get("endpoints", {}).items():
-        icon = "\u2713" if ep["ok"] else "\u2717"
-        extra = f" ({ep['error']})" if ep.get("error") else ""
-        campos = " [schema OK]" if ep.get("campos_ok") else " [schema CAMBIO]"
-        print(f"    {icon} {name}{campos}{extra}")
-    if not resultado["ok"]:
-        print("  ADVERTENCIA: Algunos endpoints de SofaScore fallaron. Los datos pueden estar incompletos.")

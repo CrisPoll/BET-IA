@@ -9,9 +9,7 @@ from bsd_client import (
     resumir_datos_partido,
     resumir_prediccion,
 )
-from sofascore_client import enriquecer_datos_partido as enriquecer_sofascore
-from odds_client import enriquecer_cuotas
-from score365_client import enriquecer_datos_partido as enriquecer_365
+from sofascore_client import enriquecer_datos_partido as enriquecer_sofascore, verificar_salud_sofascore
 from analyzer import analizar_partido
 
 logger = logging.getLogger(__name__)
@@ -71,7 +69,7 @@ class MatchSelectView(discord.ui.View):
         self.add_item(select)
 
         if total_pages > 1:
-            prev_btn = discord.ui.Button(label="◀", disabled=self.page == 0)
+            prev_btn = discord.ui.Button(label="\u25c0", disabled=self.page == 0)
             prev_btn.callback = self._prev
             self.add_item(prev_btn)
 
@@ -83,7 +81,7 @@ class MatchSelectView(discord.ui.View):
             self.add_item(page_btn)
 
             next_btn = discord.ui.Button(
-                label="▶", disabled=self.page == total_pages - 1
+                label="\u25b6", disabled=self.page == total_pages - 1
             )
             next_btn.callback = self._next
             self.add_item(next_btn)
@@ -98,7 +96,7 @@ class MatchSelectView(discord.ui.View):
             return
         self.stop()
         await interaction.response.edit_message(
-            content="✅ Analizando partido seleccionado...", view=None
+            content="\u2705 Analizando partido seleccionado...", view=None
         )
         await self.analyze_callback(interaction.channel, match)
 
@@ -122,10 +120,11 @@ class BettingCog(commands.Cog):
     async def partidos(self, ctx: commands.Context):
         async with ctx.typing():
             try:
+                verificar_salud_sofascore(detallado=False)
                 self._match_cache = obtener_proximos_partidos()
             except Exception as e:
                 await ctx.send(
-                    f"❌ Error al obtener partidos: {e}\n"
+                    f"\u274c Error al obtener partidos: {e}\n"
                     "Verifica que `BSD_API_KEY` esté configurada en `.env`."
                 )
                 return
@@ -151,7 +150,7 @@ class BettingCog(commands.Cog):
                 detalle = obtener_detalle_partido(match_id)
             except Exception as e:
                 await ctx.send(
-                    f"❌ Error al obtener el partido {match_id}: {e}"
+                    f"\u274c Error al obtener el partido {match_id}: {e}"
                 )
                 return
 
@@ -177,15 +176,15 @@ class BettingCog(commands.Cog):
         visitante = match.get("away_team", "?")
 
         progress_msg = await channel.send(
-            f"⏳ Analizando **{local} vs {visitante}**...\n"
-            f"▫ 1/6 Obteniendo datos del partido..."
+            f"\u23f3 Analizando **{local} vs {visitante}**...\n"
+            f"\u25ab 1/3 Obteniendo datos del partido..."
         )
 
         try:
             detalle = obtener_detalle_partido(match_id)
         except Exception as e:
             await progress_msg.edit(
-                content=f"❌ Error al obtener detalle del partido: {e}"
+                content=f"\u274c Error al obtener detalle del partido: {e}"
             )
             return
 
@@ -202,9 +201,6 @@ class BettingCog(commands.Cog):
             prediccion = {}
 
         datos_resumidos = resumir_datos_partido(detalle)
-        datos_resumidos["_league_name"] = match.get(
-            "_league_name", match.get("league", {}).get("name", "?")
-        )
         datos_resumidos["partido"] = (
             f"{detalle.get('home_team', local)} vs "
             f"{detalle.get('away_team', visitante)}"
@@ -212,9 +208,9 @@ class BettingCog(commands.Cog):
         prediccion_resumida = resumir_prediccion(prediccion)
 
         await progress_msg.edit(
-            content=f"⏳ Analizando **{local} vs {visitante}**...\n"
-            f"✓ Datos del partido + predicción ML\n"
-            f"▫ 2/6 Enriquiciendo con SofaScore..."
+            content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
+            f"\u2713 Datos del partido + prediccion ML\n"
+            f"\u25ab 2/3 Enrichiendo con SofaScore..."
         )
 
         try:
@@ -223,43 +219,21 @@ class BettingCog(commands.Cog):
             logger.warning(f"SofaScore falló: {e}")
 
         await progress_msg.edit(
-            content=f"⏳ Analizando **{local} vs {visitante}**...\n"
-            f"✓ Datos del partido + predicción ML + SofaScore\n"
-            f"▫ 3/6 Enriquiciendo con 365Score..."
-        )
-
-        try:
-            datos_resumidos = enriquecer_365(datos_resumidos)
-        except Exception as e:
-            logger.warning(f"365Score falló: {e}")
-
-        await progress_msg.edit(
-            content=f"⏳ Analizando **{local} vs {visitante}**...\n"
-            f"✓ Datos del partido + predicción ML + SofaScore + 365Score\n"
-            f"▫ 4/6 Enriquiciendo cuotas..."
-        )
-
-        try:
-            datos_resumidos = enriquecer_cuotas(datos_resumidos)
-        except Exception as e:
-            logger.warning(f"Odds API falló: {e}")
-
-        await progress_msg.edit(
-            content=f"⏳ Analizando **{local} vs {visitante}**...\n"
-            f"✓ Datos + predicción ML + SofaScore + 365Score + cuotas\n"
-            f"▫ 5/6 Consultando a DeepSeek (esto puede tardar ~30s)..."
+            content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
+            f"\u2713 Datos del partido + prediccion ML + SofaScore\n"
+            f"\u25ab 3/3 Consultando a DeepSeek (esto puede tardar ~30s)..."
         )
 
         try:
             analisis = analizar_partido(datos_resumidos, prediccion_resumida)
         except Exception as e:
             await progress_msg.edit(
-                content=f"❌ Error al consultar la IA: {e}"
+                content=f"\u274c Error al consultar la IA: {e}"
             )
             return
 
         await progress_msg.edit(
-            content=f"✅ Análisis completado: **{local} vs {visitante}**"
+            content=f"\u2705 Análisis completado: **{local} vs {visitante}**"
         )
 
         chunks = _split_response(analisis)

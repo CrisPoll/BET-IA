@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 *.pyo
+_health_log.jsonl
+_schema_fingerprint.json
