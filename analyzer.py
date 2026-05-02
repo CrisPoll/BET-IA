@@ -14,6 +14,7 @@ from sofascore_client import (
     _formatear_h2h_sofascore_para_prompt,
     _formatear_detalle_evento_para_prompt,
     _formatear_form_performance_para_prompt,
+    _formatear_standings_para_prompt,
 )
 
 load_dotenv()
@@ -22,8 +23,8 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 MODEL_NAME = "deepseek/deepseek-v4-pro"
-MAX_TOKENS = 32000
-TEMPERATURE = 0.3
+MAX_TOKENS = 100000  # Holgado: incluye reasoning interno + respuesta visible
+TEMPERATURE = 0.3  # Baja temperatura para análisis más consistente
 
 SYSTEM_PROMPT = """Eres un experto analista de Value Betting en fútbol, con mentalidad crítica y escéptica ante datos imperfectos.
 
@@ -54,7 +55,7 @@ REGLAS DE REMATES (TIROS):
 
 REGLAS DE TARJETAS Y ÁRBITRO:
 - La fuente principal para amarillas son los promedios de BSD (amarillas_promedio, faltas_promedio).
-- Si el árbitro tiene fama de "tarjetero" (promedio alto de amarillas por partido), aumenta la proyeccion.
+- Si el árbitro tiene datos de carrera (amarillas_carrera, rojas_carrera), usalo para evaluar su tendencia. Un promedio alto de amarillas por partido indica arbitro "tarjetero".
 - Derbis y partidos de alta rivalidad → mas tarjetas esperadas.
 - Partidos con poco en juego (mitad de tabla, sin descenso) → menos tarjetas.
 - Si el árbitro NO esta asignado aun, NO inventes sustitutos. Simplemente indica que falta ese dato.
@@ -128,6 +129,9 @@ Fecha: {datos_resumidos.get('fecha', 'Desconocida')}
 
 ### ÁRBITRO
 {f"Nombre: {datos_resumidos['arbitro'].get('nombre', 'Desconocido')} ({datos_resumidos['arbitro'].get('nacionalidad', '?')})" if datos_resumidos.get('arbitro') else "ARBITRO NO ASIGNADO. No asumas nada sobre su estilo; simplemente omite el factor arbitral."}
+{f"\n- Amarillas en carrera: {datos_resumidos['arbitro'].get('amarillas_carrera', '?')}" if datos_resumidos.get('arbitro') and datos_resumidos['arbitro'].get('amarillas_carrera') else ""}
+{f"\n- Rojas en carrera: {datos_resumidos['arbitro'].get('rojas_carrera', '?')}" if datos_resumidos.get('arbitro') and datos_resumidos['arbitro'].get('rojas_carrera') else ""}
+{f"\n- Partidos dirigidos: {datos_resumidos['arbitro'].get('partidos_carrera', '?')}" if datos_resumidos.get('arbitro') and datos_resumidos['arbitro'].get('partidos_carrera') else ""}
 
 ### CUOTAS DEL BOOKMAKER
 - Local: {datos_resumidos['cuotas'].get('local', 'N/D')}
@@ -151,8 +155,9 @@ Fecha: {datos_resumidos.get('fecha', 'Desconocida')}
 ### NOTA SOBRE DATOS DISPONIBLES
 - REMATES Y TIROS: Usa los promedios de BSD en la seccion FORMA (remates_promedio, remates_arco_promedio).
 - AMARILLAS: Usa amarillas_promedio y faltas_promedio de BSD. Cruza esto con la info del arbitro.
-- CORNERS: BSD no proporciona corners. Haz una inferencia cualitativa basada en estilo de juego y posesion.
+- CORNERS: No hay datos de corners por equipo en las APIs disponibles. Haz una inferencia cualitativa basada en estilo de juego (equipos de posesion alta y muchos remates generan mas corners).
 - POSESION: Infiere del estilo de juego y perfil de los entrenadores.
+- FATIGA: No hay datos exactos de fechas de ultimos partidos. Usa el PPG y la forma reciente como proxy de fatiga/ritmo. Equipos con alta carga de partidos (Champions + Liga) suelen rotar mas.
 - LESIONES: SofaScore YA NO proporciona datos de lesiones via API. Usa BAJAS BSD como referencia secundaria con PRECAUCION. La alineacion de SofaScore es quien define quien JUEGA.
 
 ### ALINEACION DEL PARTIDO (SofaScore)
@@ -183,6 +188,7 @@ Fecha: {datos_resumidos.get('fecha', 'Desconocida')}
 ---
 Analiza los datos anteriores y proporciona tu evaluación de value betting siguiendo el formato establecido.
 
+{_formatear_standings_para_prompt(datos_resumidos)}
 {_formatear_detalle_evento_para_prompt(datos_resumidos)}
 {_formatear_h2h_sofascore_para_prompt(datos_resumidos)}
 {_formatear_alineaciones_para_prompt(datos_resumidos)}
@@ -230,6 +236,9 @@ def analizar_partido(datos_resumidos: dict, prediccion_resumida: dict) -> str:
             "HTTP-Referer": "https://github.com/betting-ai",
             "X-Title": "Betting AI - Value Betting Analyzer",
         },
+        extra_body={
+            "include_reasoning": True,
+        },
     )
 
     finish_reason = response.choices[0].finish_reason
@@ -239,14 +248,18 @@ def analizar_partido(datos_resumidos: dict, prediccion_resumida: dict) -> str:
             f"Aumenta MAX_TOKENS (actual: {MAX_TOKENS})"
         )
 
+    razonamiento = getattr(response.choices[0].message, "reasoning_content", None) or ""
+    razonamiento = getattr(response.choices[0].message, "reasoning_content", None) or ""
     contenido = response.choices[0].message.content
     if contenido is None:
-        razonamiento = getattr(response.choices[0].message, "reasoning_content", None)
         raise RuntimeError(
             "El modelo no devolvió contenido visible. "
             "Probablemente agotó los tokens en razonamiento interno. "
             f"Tokens de razonamiento usados: ~{len(razonamiento) if razonamiento else 'N/D'}"
         )
+
+    if razonamiento:
+        print(f"\n  [DeepSeek razonó {len(razonamiento)} chars internamente]")
 
     return contenido
 

@@ -9,7 +9,7 @@ from bsd_client import (
     resumir_datos_partido,
     resumir_prediccion,
 )
-from sofascore_client import enriquecer_datos_partido as enriquecer_sofascore, verificar_salud_sofascore
+from sofascore_client import enriquecer_datos_partido as enriquecer_sofascore, verificar_salud_sofascore, obtener_partidos_sofascore_only, obtener_datos_completos_sofascore
 from analyzer import analizar_partido
 
 logger = logging.getLogger(__name__)
@@ -122,6 +122,9 @@ class BettingCog(commands.Cog):
             try:
                 verificar_salud_sofascore(detallado=False)
                 self._match_cache = obtener_proximos_partidos()
+                partidos_ss = obtener_partidos_sofascore_only()
+                self._match_cache.extend(partidos_ss)
+                self._match_cache.sort(key=lambda p: p.get("event_date", "") if isinstance(p.get("event_date"), str) else "")
             except Exception as e:
                 await ctx.send(
                     f"\u274c Error al obtener partidos: {e}\n"
@@ -174,68 +177,74 @@ class BettingCog(commands.Cog):
         match_id = match.get("id")
         local = match.get("home_team", "?")
         visitante = match.get("away_team", "?")
+        es_sofascore_only = match.get("_source") == "sofascore_only"
 
-        progress_msg = await channel.send(
-            f"\u23f3 Analizando **{local} vs {visitante}**...\n"
-            f"\u25ab 1/3 Obteniendo datos del partido..."
-        )
-
-        try:
-            detalle = obtener_detalle_partido(match_id)
-        except Exception as e:
-            await progress_msg.edit(
-                content=f"\u274c Error al obtener detalle del partido: {e}"
+        if es_sofascore_only:
+            progress_msg = await channel.send(
+                f"\u23f3 Analizando **{local} vs {visitante}**...\n"
+                f"\u25ab 1/2 Obteniendo datos via SofaScore..."
             )
-            return
-
-        try:
-            predicciones = obtener_predicciones(match_id=match_id)
-            if predicciones:
-                prediccion = predicciones[0]
-            else:
-                league_id = match.get("league", {}).get("id")
-                predicciones = obtener_predicciones(league_id=league_id)
-                prediccion = predicciones[0] if predicciones else {}
-        except Exception as e:
-            logger.warning(f"Error obteniendo predicciones: {e}")
-            prediccion = {}
-
-        datos_resumidos = resumir_datos_partido(detalle)
-        datos_resumidos["partido"] = (
-            f"{detalle.get('home_team', local)} vs "
-            f"{detalle.get('away_team', visitante)}"
-        )
-        prediccion_resumida = resumir_prediccion(prediccion)
-
-        await progress_msg.edit(
-            content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
-            f"\u2713 Datos del partido + prediccion ML\n"
-            f"\u25ab 2/3 Enrichiendo con SofaScore..."
-        )
-
-        try:
-            datos_resumidos = enriquecer_sofascore(datos_resumidos)
-        except Exception as e:
-            logger.warning(f"SofaScore falló: {e}")
-
-        await progress_msg.edit(
-            content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
-            f"\u2713 Datos del partido + prediccion ML + SofaScore\n"
-            f"\u25ab 3/3 Consultando a DeepSeek (esto puede tardar ~30s)..."
-        )
+            try:
+                datos_resumidos = obtener_datos_completos_sofascore(match)
+            except Exception as e:
+                await progress_msg.edit(content=f"\u274c Error: {e}")
+                return
+            ss = datos_resumidos.get("_sofascore", {})
+            if not ss.get("disponible"):
+                await progress_msg.edit(content=f"\u274c SofaScore no disponible: {ss.get('error','?')}")
+                return
+            prediccion_resumida = {}
+            await progress_msg.edit(
+                content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
+                f"\u2713 SofaScore (datos completos)\n"
+                f"\u25ab 2/2 Consultando a DeepSeek..."
+            )
+        else:
+            progress_msg = await channel.send(
+                f"\u23f3 Analizando **{local} vs {visitante}**...\n"
+                f"\u25ab 1/3 Obteniendo datos del partido..."
+            )
+            try:
+                detalle = obtener_detalle_partido(match_id)
+            except Exception as e:
+                await progress_msg.edit(content=f"\u274c Error al obtener detalle del partido: {e}")
+                return
+            try:
+                predicciones = obtener_predicciones(match_id=match_id)
+                if predicciones:
+                    prediccion = predicciones[0]
+                else:
+                    league_id = match.get("league", {}).get("id")
+                    predicciones = obtener_predicciones(league_id=league_id)
+                    prediccion = predicciones[0] if predicciones else {}
+            except Exception as e:
+                logger.warning(f"Error obteniendo predicciones: {e}")
+                prediccion = {}
+            datos_resumidos = resumir_datos_partido(detalle)
+            datos_resumidos["partido"] = f"{detalle.get('home_team', local)} vs {detalle.get('away_team', visitante)}"
+            prediccion_resumida = resumir_prediccion(prediccion)
+            await progress_msg.edit(
+                content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
+                f"\u2713 Datos del partido + prediccion ML\n"
+                f"\u25ab 2/3 Enrichiendo con SofaScore..."
+            )
+            try:
+                datos_resumidos = enriquecer_sofascore(datos_resumidos)
+            except Exception as e:
+                logger.warning(f"SofaScore fallo: {e}")
+            await progress_msg.edit(
+                content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
+                f"\u2713 Datos del partido + prediccion ML + SofaScore\n"
+                f"\u25ab 3/3 Consultando a DeepSeek..."
+            )
 
         try:
             analisis = analizar_partido(datos_resumidos, prediccion_resumida)
         except Exception as e:
-            await progress_msg.edit(
-                content=f"\u274c Error al consultar la IA: {e}"
-            )
+            await progress_msg.edit(content=f"\u274c Error al consultar la IA: {e}")
             return
 
-        await progress_msg.edit(
-            content=f"\u2705 Análisis completado: **{local} vs {visitante}**"
-        )
-
+        await progress_msg.edit(content=f"\u2705 Analisis completado: **{local} vs {visitante}**")
         chunks = _split_response(analisis)
         for chunk in chunks:
             await channel.send(chunk)

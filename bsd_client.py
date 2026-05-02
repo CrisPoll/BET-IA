@@ -20,23 +20,15 @@ BSD_API_KEY = os.getenv("BSD_API_KEY")
 
 # IDs de ligas y torneos según BSD
 TOP_LEAGUES = {
-    # Grandes ligas europeas
+    # Ligas objetivo
+    "Brasileirão Serie A": 9,
     "Premier League": 1,
-    "Liga Portugal": 2,   # Fuera del top 5, incluida como referencia
     "La Liga": 3,
-    "Serie A": 4,
     "Bundesliga": 5,
-    "Ligue 1": 6,
-    # Torneos internacionales
-    "Champions League": 7,
-    "Europa League": 8,
-    # Torneos sudamericanos
-    "Copa Libertadores": 32,
-    "Copa Sudamericana": 33,
 }
 
 # IDs de las ligas y torneos objetivo para el análisis
-TARGET_LEAGUE_IDS = [1, 3, 4, 5, 6, 7, 8, 32, 33]
+TARGET_LEAGUE_IDS = [9, 3, 5, 1]  # Brasileirao, La Liga, Bundesliga, Premier
 
 # Mapeo de ID de liga a nombre
 LEAGUE_NAMES = {v: k for k, v in TOP_LEAGUES.items()}
@@ -248,12 +240,64 @@ def _filtrar_h2h_reciente(h2h: dict, anos_max: int = 3) -> dict:
     if not filtrados:
         return h2h
 
+    def _parse_score(m):
+        score_str = m.get("score", "0-0") or "0-0"
+        parts = str(score_str).split("-")
+        hg = int(parts[0]) if len(parts) >= 1 else 0
+        ag = int(parts[1]) if len(parts) >= 2 else 0
+        h2h_home = m.get("home", "")
+        h2h_away = m.get("away", "")
+        return hg, ag, h2h_home, h2h_away
+
+    # Determinar el equipo local actual (de este partido)
+    current_home = h2h.get("_home_team", "")
+    if not current_home:
+        # Inferir del primer enfrentamiento
+        first_away = filtrados[0].get("away", "")
+        first_home = filtrados[0].get("home", "")
+        # fallback
+        current_home = first_home
+
     total = len(filtrados)
-    home_w = sum(1 for m in filtrados if m.get("home_goals", 0) > m.get("away_goals", 0))
-    draws = sum(1 for m in filtrados if m.get("home_goals") == m.get("away_goals"))
-    away_w = total - home_w - draws
-    home_g = sum(m.get("home_goals", 0) for m in filtrados)
-    away_g = sum(m.get("away_goals", 0) for m in filtrados)
+    home_w = 0
+    draws = 0
+    away_w = 0
+    home_g = 0
+    away_g = 0
+
+    for m in filtrados:
+        hg, ag, h2h_home, h2h_away = _parse_score(m)
+        hg = hg or 0
+        ag = ag or 0
+        # Si el "home" en el H2H es el equipo local actual
+        if h2h_home and current_home and h2h_home.lower() == current_home.lower():
+            home_g += hg
+            away_g += ag
+            if hg > ag:
+                home_w += 1
+            elif ag > hg:
+                away_w += 1
+            else:
+                draws += 1
+        elif h2h_away and current_home and h2h_away.lower() == current_home.lower():
+            home_g += ag
+            away_g += hg
+            if ag > hg:
+                home_w += 1
+            elif hg > ag:
+                away_w += 1
+            else:
+                draws += 1
+        else:
+            # No podemos determinar, asumir que home en H2H es local
+            home_g += hg
+            away_g += ag
+            if hg > ag:
+                home_w += 1
+            elif ag > hg:
+                away_w += 1
+            else:
+                draws += 1
 
     return {
         "total_partidos": total,
@@ -353,6 +397,7 @@ def resumir_datos_partido(evento: dict) -> dict:
 
     # Head to Head histórico (filtrado a últimos 3 años)
     h2h = evento.get("head_to_head") or {}
+    h2h["_home_team"] = evento.get("home_team", "")
     h2h_filtrado = _filtrar_h2h_reciente(h2h, anos_max=3)
     resumen["h2h"] = h2h_filtrado
 
@@ -381,6 +426,9 @@ def resumir_datos_partido(evento: dict) -> dict:
             "nombre": referee.get("name"),
             "nacionalidad": referee.get("country"),
             "id": referee.get("id"),
+            "amarillas_carrera": referee.get("yellowCards"),
+            "rojas_carrera": referee.get("redCards"),
+            "partidos_carrera": referee.get("career_games"),
         }
     elif isinstance(referee, str) and referee.strip():
         resumen["arbitro"] = {"nombre": referee}

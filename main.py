@@ -18,7 +18,7 @@ from bsd_client import (
     resumir_prediccion,
     depurar_partido,
 )
-from sofascore_client import enriquecer_datos_partido, verificar_salud_sofascore
+from sofascore_client import enriquecer_datos_partido, verificar_salud_sofascore, obtener_partidos_sofascore_only, obtener_datos_completos_sofascore
 from analyzer import analizar_partido
 
 logging.basicConfig(level=logging.INFO, format="  [%(levelname)s] %(message)s")
@@ -66,10 +66,43 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
     match_id = partido.get("id")
     local = partido.get("home_team", "?")
     visitante = partido.get("away_team", "?")
+    es_sofascore_only = partido.get("_source") == "sofascore_only"
 
     print(f"\n  Obteniendo datos de: {local} vs {visitante}...")
 
-    # 1. Obtener detalle completo del partido (BSD)
+    if es_sofascore_only:
+        # Liga solo en SofaScore, sin BSD
+        try:
+            datos_resumidos = obtener_datos_completos_sofascore(partido)
+        except Exception as e:
+            print(f"  \u2717 Error al obtener datos de SofaScore: {e}")
+            return None, None
+
+        ss = datos_resumidos.get("_sofascore", {})
+        if not ss.get("disponible"):
+            print(f"  \u2717 SofaScore no disponible: {ss.get('error', '?')}")
+            return None, None
+
+        print("  \u2713 SofaScore (datos completos)")
+
+        # No hay prediccion BSD, construir una vacia
+        prediccion_resumida = {}
+
+        if verbose:
+            print(f"\n  SOFASCORE-ONLY (sin BSD): {local} vs {visitante}")
+            parts = []
+            if ss.get("alineaciones"):
+                parts.append("alineaciones")
+            if ss.get("h2h"):
+                parts.append("H2H")
+            if ss.get("detalle_evento"):
+                parts.append("arbitro/managers")
+            if ss.get("form_performance"):
+                parts.append("form performance")
+            print(f"  Datos disponibles: {', '.join(parts) if parts else 'basico'}")
+        return datos_resumidos, prediccion_resumida
+
+    # ── Flujo BSD + SofaScore (normal) ──
     try:
         detalle = obtener_detalle_partido(match_id)
         print("  \u2713 Datos BSD del partido obtenidos")
@@ -152,10 +185,13 @@ def main():
 
         if opcion == "1":
             print("\n  Cargando próximos partidos de ligas europeas y torneos internacionales...")
-            print("  (Premier, La Liga, Serie A, Bundesliga, Ligue 1, Champions, Europa League, Libertadores, Sudamericana)")
+            print("  (Brasileirao, Premier League, La Liga, Bundesliga + Liga 1 Peru)")
             try:
                 verificar_salud_sofascore(detallado=True)
                 partidos_cache = obtener_proximos_partidos()
+                partidos_ss = obtener_partidos_sofascore_only()
+                partidos_cache.extend(partidos_ss)
+                partidos_cache.sort(key=lambda p: p.get("event_date", "") if isinstance(p.get("event_date"), str) else "")
                 _mostrar_partidos(partidos_cache)
             except Exception as e:
                 print(f"\n  \u2717 Error al obtener partidos: {e}")
