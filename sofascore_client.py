@@ -333,16 +333,20 @@ def _extraer_performance(data: dict, team_id: int) -> dict:
     total_goles_favor = 0
     total_goles_contra = 0
     puntos = 0
+    detalle = []
 
     for ev in events:
         hs = ev.get("homeScore", {}).get("current", 0) or 0
         as_ = ev.get("awayScore", {}).get("current", 0) or 0
         wc = ev.get("winnerCode", 0)
         home_id = ev.get("homeTeam", {}).get("id")
+        home_name = ev.get("homeTeam", {}).get("name", "")
+        away_name = ev.get("awayTeam", {}).get("name", "")
 
         team_home = (home_id == team_id)
         gf = hs if team_home else as_
         gc = as_ if team_home else hs
+        rival = away_name if team_home else home_name
         total_goles_favor += gf
         total_goles_contra += gc
 
@@ -350,6 +354,13 @@ def _extraer_performance(data: dict, team_id: int) -> dict:
             puntos += 3
         elif wc == 3:
             puntos += 1
+
+        detalle.append({
+            "rival": rival,
+            "local": team_home,
+            "gf": gf,
+            "gc": gc,
+        })
 
     n = len(events)
     return {
@@ -361,6 +372,7 @@ def _extraer_performance(data: dict, team_id: int) -> dict:
         "promedio_goles_contra": round(total_goles_contra / n, 2),
         "puntos": puntos,
         "ppg": round(puntos / n, 2),
+        "detalle": detalle,
     }
 
 
@@ -976,6 +988,7 @@ def enriquecer_datos_partido(datos_bsd: dict) -> dict:
 def _formatear_form_performance_para_prompt(datos: dict) -> str:
     """
     Formatea los datos de performance (form reciente) de SofaScore para el prompt.
+    Incluye desglose por partido para que la IA evalue consistencia (varianza).
     """
     sofas = datos.get("_sofascore", {})
     if not sofas.get("disponible") or not sofas.get("form_performance"):
@@ -995,6 +1008,13 @@ def _formatear_form_performance_para_prompt(datos: dict) -> str:
             f"GF: {perf.get('goles_favor', '?')} | GC: {perf.get('goles_contra', '?')} | "
             f"Prom GF: {perf.get('promedio_goles_favor', '?')} | Prom GC: {perf.get('promedio_goles_contra', '?')}"
         )
+        detalle = perf.get("detalle", [])
+        if detalle:
+            partes.append("  Desglose por partido (del mas reciente al mas antiguo):")
+            for i, m in enumerate(detalle[:5]):
+                loc = "CASA" if m.get("local") else "FUERA"
+                partes.append(f"    {i+1}. vs {m.get('rival', '?')} ({loc}): {m.get('gf', 0)}-{m.get('gc', 0)}")
+            partes.append("  NOTA: Evaluar si los resultados fueron consistentes o si hubo outliers (ej: goleada unica que infla el promedio).")
     return "\n".join(partes)
 
 

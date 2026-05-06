@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BSD_BASE_URL = "https://sports.bzzoiro.com/api"
+BSD_V2_BASE = "https://sports.bzzoiro.com/api/v2"
 BSD_API_KEY = os.getenv("BSD_API_KEY")
 
 # IDs de ligas y torneos según BSD
@@ -50,11 +51,11 @@ def _headers():
 
 def _get(endpoint: str, params: dict = None) -> dict:
     """
-    Realiza una petición GET a la BSD API.
+    Realiza una peticion GET a la BSD API v1.
 
     Args:
         endpoint: Ruta del endpoint (sin la base URL).
-        params: Parámetros de consulta opcionales.
+        params: Parametros de consulta opcionales.
 
     Returns:
         Respuesta JSON como diccionario.
@@ -65,12 +66,23 @@ def _get(endpoint: str, params: dict = None) -> dict:
     return response.json()
 
 
+def _get_v2(endpoint: str, params: dict = None) -> dict:
+    """Peticion GET a la BSD API v2."""
+    url = f"{BSD_V2_BASE}/{endpoint}"
+    response = requests.get(url, headers=_headers(), params=params, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
 def obtener_proximos_partidos(league_ids: list = None) -> list:
     """
-    Obtiene los próximos partidos de las ligas especificadas.
+    Obtiene los próximos partidos de las ligas especificadas via API v2.
 
-    La BSD API devuelve por defecto partidos desde hace 3 horas
-    hasta 7 días en el futuro. Filtramos solo los no iniciados.
+    La BSD API v2 devuelve partidos con status=notstarted.
+    Usa paginacion nativa (limit=200).
+
+    Compatibilidad: agrega campo sintetico 'league' como dict {id, name}
+    para mantener compatibilidad con codigo que espera el formato v1.
 
     Args:
         league_ids: Lista de IDs de liga. Si es None, usa las 5 grandes.
@@ -88,21 +100,20 @@ def obtener_proximos_partidos(league_ids: list = None) -> list:
 
     def _fetch_league(liga_id):
         try:
-            data = _get("events/", params={
+            data = _get_v2("events/", params={
+                "league_id": liga_id,
                 "date_from": today,
                 "date_to": next_week,
-                "league": liga_id,
-                "tz": "Europe/Madrid",
+                "status": "notstarted",
+                "limit": 200,
             })
             resultados = data.get("results", [])
-            league_matches = []
-            for partido in resultados:
-                if partido.get("status") == "notstarted":
-                    partido["_league_name"] = LEAGUE_NAMES.get(
-                        liga_id, f"Liga {liga_id}"
-                    )
-                    league_matches.append(partido)
-            return league_matches
+            league_name = LEAGUE_NAMES.get(liga_id, f"Liga {liga_id}")
+            for p in resultados:
+                p["_league_name"] = league_name
+                # Compatibilidad v1: emular el objeto 'league'
+                p["league"] = {"id": p.get("league_id", liga_id), "name": league_name}
+            return resultados
         except requests.RequestException as e:
             print(f"  [AVISO] No se pudieron obtener partidos de "
                   f"{LEAGUE_NAMES.get(liga_id, f'Liga {liga_id}')}: {e}")
@@ -113,7 +124,6 @@ def obtener_proximos_partidos(league_ids: list = None) -> list:
         for future in as_completed(futures):
             todos_partidos.extend(future.result())
 
-    # Ordenar por fecha
     todos_partidos.sort(key=lambda p: p.get("event_date", ""))
     return todos_partidos
 
@@ -136,23 +146,24 @@ def obtener_detalle_partido(match_id: int) -> dict:
 
 def obtener_predicciones(match_id: int = None, league_id: int = None) -> list:
     """
-    Obtiene predicciones ML (CatBoost) de la BSD API.
+    Obtiene predicciones ML (CatBoost) de la BSD API v2.
 
     Args:
-        match_id: ID del partido para filtrar una predicción específica.
+        match_id: ID del partido para filtrar una prediccion especifica.
         league_id: ID de liga para filtrar predicciones.
 
     Returns:
-        Lista de predicciones.
+        Lista de predicciones en formato v2.
     """
-    params = {}
+    params = {"status": "upcoming", "limit": 200}
     if league_id:
-        params["league"] = league_id
+        params["league_id"] = league_id
 
-    data = _get("predictions/", params=params)
+    data = _get_v2("predictions/", params=params)
     predicciones = data.get("results", [])
 
     if match_id:
+        # Filtrado por event.id (v2 usa event.id, no event_id directo)
         predicciones = [
             p for p in predicciones
             if p.get("event", {}).get("id") == match_id
@@ -343,6 +354,10 @@ def resumir_datos_partido(evento: dict) -> dict:
     resumen["home_team_id"] = home_obj.get("id")
     resumen["away_team_id"] = away_obj.get("id")
 
+    # Liga (objeto con ID)
+    league_obj = evento.get("league") or {}
+    resumen["league_id"] = league_obj.get("id")
+
     # Cuotas del bookmaker (1X2)
     resumen["cuotas"] = {
         "local": evento.get("odds_home"),
@@ -409,6 +424,8 @@ def resumir_datos_partido(evento: dict) -> dict:
     # Entrenadores
     home_coach = evento.get("home_coach") or {}
     away_coach = evento.get("away_coach") or {}
+    resumen["home_coach_id"] = home_coach.get("id")
+    resumen["away_coach_id"] = away_coach.get("id")
     resumen["entrenador_local"] = {
         "nombre": home_coach.get("name"),
         "formacion": home_coach.get("preferred_formation"),
@@ -427,6 +444,7 @@ def resumir_datos_partido(evento: dict) -> dict:
     # Arbitro
     referee = evento.get("referee")
     if isinstance(referee, dict):
+        resumen["referee_id"] = referee.get("id")
         resumen["arbitro"] = {
             "nombre": referee.get("name"),
             "nacionalidad": referee.get("country"),
@@ -461,10 +479,11 @@ def resumir_datos_partido(evento: dict) -> dict:
 
 def resumir_prediccion(prediccion: dict) -> dict:
     """
-    Resume una predicción ML de BSD para enviar a la IA.
+    Resume una prediccion ML de BSD para enviar a la IA.
+    Soporta formato v1 (flat) y v2 (markets anidados).
 
     Args:
-        prediccion: Diccionario de predicción desde BSD.
+        prediccion: Diccionario de prediccion desde BSD (v1 o v2).
 
     Returns:
         Diccionario resumido con solo los campos relevantes.
@@ -472,6 +491,41 @@ def resumir_prediccion(prediccion: dict) -> dict:
     if not prediccion:
         return {}
 
+    # Detectar formato v2: tiene clave 'markets'
+    if "markets" in prediccion:
+        markets = prediccion.get("markets", {})
+        match_result = markets.get("match_result", {})
+        expected_goals = markets.get("expected_goals", {})
+        over_under = markets.get("over_under", {})
+        btts = markets.get("btts", {})
+        score = markets.get("score", {})
+        recs = prediccion.get("recommendations", {})
+        model = prediccion.get("model", {})
+
+        return {
+            "prob_local": match_result.get("prob_home"),
+            "prob_empate": match_result.get("prob_draw"),
+            "prob_visitante": match_result.get("prob_away"),
+            "resultado_predicho": match_result.get("predicted"),
+            "xG_local": expected_goals.get("home"),
+            "xG_visitante": expected_goals.get("away"),
+            "prob_over_15": over_under.get("prob_over_15"),
+            "prob_over_25": over_under.get("prob_over_25"),
+            "prob_over_35": over_under.get("prob_over_35"),
+            "prob_btts": btts.get("prob_yes"),
+            "marcador_probable": score.get("most_likely"),
+            "confianza_modelo": model.get("confidence"),
+            "version_modelo": model.get("version"),
+            "recomienda_over_15": recs.get("over_15"),
+            "recomienda_over_25": recs.get("over_25"),
+            "recomienda_over_35": recs.get("over_35"),
+            "recomienda_btts": recs.get("btts"),
+            "favorite": recs.get("favorite"),
+            "favorite_prob": recs.get("favorite_prob"),
+            "bet_favorite": recs.get("bet_favorite"),
+        }
+
+    # Formato v1 (flat)
     return {
         "prob_local": prediccion.get("prob_home_win"),
         "prob_empate": prediccion.get("prob_draw"),

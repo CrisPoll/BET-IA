@@ -9,8 +9,10 @@ from bsd_client import (
     resumir_datos_partido,
     resumir_prediccion,
 )
+from bsd_client_v2 import enriquecer_con_v2
 from sofascore_client import enriquecer_datos_partido as enriquecer_sofascore, verificar_salud_sofascore, obtener_partidos_sofascore_only, obtener_datos_completos_sofascore
 from flashscore_client import enriquecer_datos_partido as enriquecer_flashscore
+from valuestats_client import enriquecer_arbitro_valuestats
 from betsafe_client import obtener_cuotas_betsafe, obtener_cuotas_betsafe_desde_url
 from analyzer import analizar_partido
 
@@ -234,7 +236,19 @@ class BettingCog(commands.Cog):
             await progress_msg.edit(
                 content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
                 f"\u2713 Datos del partido + prediccion ML\n"
-                f"\u25ab 2/3 Enrichiendo con SofaScore..."
+                f"\u25ab 2/4 Enrichiendo con BSD v2..."
+            )
+            try:
+                datos_resumidos = enriquecer_con_v2(datos_resumidos, match_id)
+                prediccion_v2 = datos_resumidos.pop("_v2_prediction_raw", {})
+                if prediccion_v2 and not prediccion_resumida:
+                    prediccion_resumida = resumir_prediccion(prediccion_v2)
+            except Exception as e:
+                logger.warning(f"BSD v2 enrichment fallo: {e}")
+            await progress_msg.edit(
+                content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
+                f"\u2713 Datos del partido + prediccion ML + BSD v2\n"
+                f"\u25ab 3/4 Enrichiendo con SofaScore..."
             )
             try:
                 datos_resumidos = enriquecer_sofascore(datos_resumidos)
@@ -242,6 +256,10 @@ class BettingCog(commands.Cog):
                 logger.warning(f"SofaScore fallo: {e}")
             try:
                 datos_resumidos = enriquecer_flashscore(datos_resumidos)
+            except Exception:
+                pass
+            try:
+                datos_resumidos = enriquecer_arbitro_valuestats(datos_resumidos)
             except Exception:
                 pass
             try:
@@ -256,8 +274,8 @@ class BettingCog(commands.Cog):
                 pass
             await progress_msg.edit(
                 content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
-                f"\u2713 Datos del partido + prediccion ML + SofaScore\n"
-                f"\u25ab 3/3 Consultando a DeepSeek..."
+                f"\u2713 Datos del partido + prediccion ML + BSD v2 + SofaScore\n"
+                f"\u25ab 4/4 Consultando a DeepSeek..."
             )
 
         self._last_analysis[channel.id] = {

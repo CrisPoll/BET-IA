@@ -28,6 +28,17 @@ from flashscore_client import (
     _formatear_standings_flashscore_para_prompt,
 )
 from betsafe_client import _formatear_cuotas_betsafe_para_prompt
+from valuestats_client import formatear_arbitro_valuestats_para_prompt
+from whoscored_client import formatear_arbitro_whoscored_para_prompt
+from bsd_client_v2 import (
+    resumir_stats_v2_para_prompt,
+    resumir_metadata_v2_para_prompt,
+    resumir_player_stats_v2_para_prompt,
+    resumir_standings_v2_para_prompt,
+    resumir_squads_v2_para_prompt,
+    resumir_manager_v2_para_prompt,
+    resumir_arbitro_v2_para_prompt,
+)
 
 load_dotenv()
 
@@ -57,12 +68,14 @@ REGLAS DE PONDERACION OBLIGATORIAS:
 - Los partidos de H2H de mas de 3 anios atras son irrelevantes (plantillas y estilos cambiaron).
 - Si el H2H proviene de Champions League pero los equipos nunca se enfrentaron con estas plantillas, dale peso BAJO.
 - LESIONES/SUSPENSIONES (BSD): Los datos de bajas vienen de BSD. Usalos como REFERENCIA pero con PRECAUCION: BSD no siempre es preciso. Si un jugador aparece como lesionado en BSD pero SofaScore lo pone titular, SofaScore MANDA -> el jugador JUEGA.
-- ARBITRO (SofaScore): Si SofaScore trae arbitro, usalo como referencia principal (reemplaza al de BSD).
+- ARBITRO: Los datos del arbitro incluyen promedios por partido (amarillas, faltas, goles) via BSD v2. Son la referencia principal para estimar tarjetas. Si no estan disponibles, usa los promedios historicos de carrera como referencia secundaria.
 
 REGLAS DE REMATES (TIROS):
 - La fuente principal son los promedios de BSD en la seccion FORMA (remates_promedio, remates_arco_promedio).
-- SI HAY DATOS DE SHOTMAP (xG por disparo), usalos para evaluar la calidad de las ocasiones.
-- SI HAY DATOS DE JUGADORES con tiros y xG individual, considera quien genera y quien esta en racha.
+- Si hay datos BSD v2 de stats (total_shots, attack, dangerous_attack, pass_accuracy_pct), incorporalos al analisis de intensidad ofensiva.
+- SI HAY DATOS DE SHOTMAP (xG por disparo) desde BSD v2 o SofaScore, usalos para evaluar la calidad de las ocasiones.
+- SI HAY DATOS DE JUGADORES con tiros y xG individual (BSD v2 player-stats), considera quien genera y quien esta en racha.
+- El xg_per_minute de BSD v2 muestra en que momentos del partido los equipos generan peligro. Usalo para patrones de gol.
 - Equipos con alto xG + alto volumen de remates al arco -> partido intenso ofensivamente.
 - Si ambos equipos promedian >10 remates y >4 al arco -> Over 2.5 gana peso adicional.
 - Si ambos equipos generan pocos remates al arco (<3) -> Under 2.5 gana peso.
@@ -72,10 +85,11 @@ REGLAS DE MOMENTUM:
 - El momentum mide dominio acumulado minuto a minuto (no solo posesion, sino presion ofensiva).
 
 REGLAS DE TARJETAS Y ARBITRO:
-- La fuente principal para amarillas son los promedios de BSD (amarillas_promedio, faltas_promedio).
-- Si el arbitro tiene datos de carrera (amarillas_carrera, rojas_carrera), usalo para evaluar su tendencia.
-- SI HAY DATOS FLASHSCORE del arbitro (promedio de amarillas esta temporada, home/away bias), son la fuente MAS CONFIABLE.
-- SI HAY DATOS FLASHSCORE de tendencia de tarjetas por equipo, usalos para ajustar expectativas.
+- La fuente PRINCIPAL para datos de arbitro es WhoScored (si esta disponible): desglose por competicion, YC/partido, RC/partido, faltas/partido.
+- Si WhoScored NO esta disponible, usa ValueStats como alternativa.
+- Si ninguno esta disponible, usa BSD v2 (avg_yellow_per_match, avg_fouls_per_match) como referencia.
+- SI HAY DATOS FLASHSCORE del arbitro, cruzalos con los datos de WhoScored/ValueStats.
+- IMPORTANTE: Si WhoScored muestra YC/partido distintos en liga local vs Champions League, usa el promedio de la competicion del partido actual, no el total.
 - Derbis y partidos de alta rivalidad -> mas tarjetas esperadas.
 - Si el arbitro NO esta asignado aun, NO inventes sustitutos.
 
@@ -83,7 +97,9 @@ REGLAS DE ALINEACIONES / DISPONIBILIDAD DE JUGADORES:
 - LA ALINEACION DE SOFASCORE ES LA FUENTE UNICA Y DEFINITIVA de que jugadores juegan.
 - Si SofaScore tiene alineacion confirmada: esos son EXACTAMENTE los jugadores que jugaran.
 - Las BAJAS BSD son referencia SECUNDARIA. SofaScore MANDA.
-- SI HAY ESTADISTICAS POR JUGADOR (xG individual, rating, pases, duelos), analiza que jugadores estan en mejor momento y como afectan al partido.
+- Si hay PLANTILLA BSD v2 (squad), usala para validar que jugadores son titulares habituales vs suplentes.
+- SI HAY ESTADISTICAS POR JUGADOR (xG individual, rating, pases, duelos) desde BSD v2 player-stats, analiza que jugadores estan en mejor momento y como afectan al partido.
+- SI HAY DATOS DE DT BSD v2 (win_pct, avg_goals, clean_sheet_pct, btts_pct, over_25_pct), son metricas cuantitativas valiosas para predecir el estilo del partido. Pesan mas que la descripcion cualitativa del perfil.
 
 REGLAS DE OVERCONFIDENCE:
 - Edges >10% son extremadamente raros. Verifica respaldo multiple.
@@ -93,12 +109,20 @@ REGLAS DE OVER/UNDER y BTTS:
 - Para Over/Under y BTTS, la forma goleadora de ESTA TEMPORADA pesa mas.
 - Si ambos equipos tienen xG alto esta temporada (>1.5), el Over 2.5 tiene mas peso.
 - No uses el argumento "H2H historico under" si los equipos actuales juegan distinto.
+- COMPETICION: Si la forma reciente del equipo proviene de su liga local contra rivales inferiores (ej: PSG vs Le Havre), penaliza esas metricas al proyectar contra un rival de elite en Champions. Las estadisticas infladas por goleadas a equipos debiles NO se transfieren a partidos de maxima exigencia.
+- VARIANZA: No te fies solo del promedio. Mira el desglose por partido. Si un equipo metio 17 goles en 5 partidos pero 9 fueron en un solo partido contra un rival debil, su promedio real de goles es ~2.0, no 3.4. Penaliza los outliers.
 
 REGLAS DE CUOTAS:
 - Las cuotas de BETSAFE son las OFICIALES. Usalas para calcular valor.
 - Ignora cualquier otra cuota (BSD) que pueda aparecer. Betsafe manda.
 
 SE CONSERVADOR: Prefiere quedarte corto en edges a inflarlos artificialmente.
+
+DATOS CONTEXTUALES NUEVOS (BSD v2):
+- Datos pre-partido (funfacts): hechos narrativos como "X no ha perdido en N partidos". Son contexto util pero no reemplazan metrica cuantitativa.
+- Tabla de posiciones con xG: si BSD v2 provee standings con xGF/xGA/xGD, usalos para comparar rendimiento real vs esperado de cada equipo en la temporada.
+- Precisión de pases y ball-tracking: si BSD v2 da pass_accuracy_pct, attack, dangerous_attack, incorporalos al analisis de dominio. Equipos con alta precision de pases + muchos dangerous_attack generan mas ocasiones claras.
+- Travel distance y derby: si BSD v2 indica is_local_derby=true o travel_distance_km alto, ajusta expectativas (derby = mas tarjetas, viaje largo = posible fatiga visitante).
 
 FORMATO DE RESPUESTA (se conciso, no repitas datos):
 
@@ -149,9 +173,9 @@ Fecha: {datos_resumidos.get('fecha', 'Desconocida')}
 
 ### ÁRBITRO
 {f"Nombre: {datos_resumidos['arbitro'].get('nombre', 'Desconocido')} ({datos_resumidos['arbitro'].get('nacionalidad', '?')})" if datos_resumidos.get('arbitro') else "ARBITRO NO ASIGNADO. No asumas nada sobre su estilo; simplemente omite el factor arbitral."}
-{f"\n- Amarillas en carrera: {datos_resumidos['arbitro'].get('amarillas_carrera', '?')}" if datos_resumidos.get('arbitro') and datos_resumidos['arbitro'].get('amarillas_carrera') else ""}
-{f"\n- Rojas en carrera: {datos_resumidos['arbitro'].get('rojas_carrera', '?')}" if datos_resumidos.get('arbitro') and datos_resumidos['arbitro'].get('rojas_carrera') else ""}
-{f"\n- Partidos dirigidos: {datos_resumidos['arbitro'].get('partidos_carrera', '?')}" if datos_resumidos.get('arbitro') and datos_resumidos['arbitro'].get('partidos_carrera') else ""}
+{f"\n- Amarillas/partido: {datos_resumidos['arbitro'].get('avg_yellow_per_match', '?')}" if datos_resumidos.get('arbitro') and datos_resumidos['arbitro'].get('avg_yellow_per_match') is not None else ""}
+{f"\n- Faltas/partido: {datos_resumidos['arbitro'].get('avg_fouls_per_match', '?')}" if datos_resumidos.get('arbitro') and datos_resumidos['arbitro'].get('avg_fouls_per_match') is not None else ""}
+{f"\n- Goles/partido: {datos_resumidos['arbitro'].get('avg_goals_per_match', '?')}" if datos_resumidos.get('arbitro') and datos_resumidos['arbitro'].get('avg_goals_per_match') is not None else ""}
 
 ### CUOTAS DEL BOOKMAKER
 {_formatear_cuotas_betsafe_para_prompt(datos_resumidos.get('_cuotas', {})) if datos_resumidos.get('_cuotas') else f'''- Local: {datos_resumidos['cuotas'].get('local', 'N/D')}
@@ -208,22 +232,79 @@ Fecha: {datos_resumidos.get('fecha', 'Desconocida')}
 ---
 Analiza los datos anteriores y proporciona tu evaluación de value betting siguiendo el formato establecido.
 
-{_formatear_standings_para_prompt(datos_resumidos)}
-{_formatear_standings_flashscore_para_prompt(datos_resumidos)}
-{_formatear_detalle_evento_para_prompt(datos_resumidos)}
-{_formatear_h2h_sofascore_para_prompt(datos_resumidos)}
-{_formatear_alineaciones_para_prompt(datos_resumidos)}
-{_formatear_players_stats_para_prompt(datos_resumidos)}
-{_formatear_form_performance_para_prompt(datos_resumidos)}
-{_formatear_shotmap_para_prompt(datos_resumidos)}
-{_formatear_momentum_para_prompt(datos_resumidos)}
-{_formatear_avg_positions_para_prompt(datos_resumidos)}
-{_formatear_incidents_para_prompt(datos_resumidos)}
-{_formatear_match_statistics_para_prompt(datos_resumidos)}
-{_formatear_team_season_stats_para_prompt(datos_resumidos)}
-{_formatear_flashscore_para_prompt(datos_resumidos)}
+    {_formatear_standings_para_prompt(datos_resumidos)}
+    {_formatear_standings_flashscore_para_prompt(datos_resumidos)}
+    {_formatear_detalle_evento_para_prompt(datos_resumidos)}
+    {_formatear_h2h_sofascore_para_prompt(datos_resumidos)}
+    {_formatear_alineaciones_para_prompt(datos_resumidos)}
+    {_formatear_players_stats_para_prompt(datos_resumidos)}
+    {_formatear_form_performance_para_prompt(datos_resumidos)}
+    {_formatear_shotmap_para_prompt(datos_resumidos)}
+    {_formatear_momentum_para_prompt(datos_resumidos)}
+    {_formatear_avg_positions_para_prompt(datos_resumidos)}
+    {_formatear_incidents_para_prompt(datos_resumidos)}
+    {_formatear_match_statistics_para_prompt(datos_resumidos)}
+    {_formatear_team_season_stats_para_prompt(datos_resumidos)}
+    {_formatear_flashscore_para_prompt(datos_resumidos)}
+
+---
+## DATOS ADICIONALES BSD v2
+{_v2_sections(datos_resumidos)}
 """
     return prompt
+
+
+def _v2_sections(datos_resumidos: dict) -> str:
+    """Construye las secciones de datos enriquecidos via BSD v2."""
+    v2 = datos_resumidos.get("_bsd_v2", {})
+    if not v2:
+        return "(No se obtuvieron datos adicionales de BSD v2 para este partido)"
+
+    partes = []
+
+    # Detalle v2 (weather, derby, travel, etc.)
+    detail = datos_resumidos.get("_v2_detail", {})
+    if detail:
+        has_any = any(detail.get(k) for k in ["is_local_derby", "is_neutral_ground"])
+        has_any = has_any or detail.get("travel_distance_km") is not None
+        has_any = has_any or (detail.get("weather") and detail["weather"].get("description"))
+        if has_any:
+            ln = ["\n### CONTEXTO DEL PARTIDO (BSD v2)"]
+            if detail.get("is_local_derby"):
+                ln.append("- DERBY LOCAL")
+            if detail.get("is_neutral_ground"):
+                ln.append("- Cancha neutral")
+            if detail.get("travel_distance_km") is not None:
+                ln.append(f"- Distancia de viaje visitante: {detail['travel_distance_km']} km")
+            if detail.get("weather") and detail["weather"].get("description"):
+                w = detail["weather"]
+                ln.append(f"- Clima: {w['description']} (codigo {w.get('code')})")
+            partes.append("\n".join(ln))
+
+    # Stats v2
+    partes.append(resumir_stats_v2_para_prompt(v2))
+
+    # ValueStats arbitro
+    partes.append(formatear_arbitro_valuestats_para_prompt(datos_resumidos))
+
+    # WhoScored arbitro
+    partes.append(formatear_arbitro_whoscored_para_prompt(datos_resumidos))
+
+    # Player stats v2
+    partes.append(resumir_player_stats_v2_para_prompt(v2))
+
+    # Metadata v2
+    partes.append(resumir_metadata_v2_para_prompt(v2))
+
+    # Standings v2
+    home_id = datos_resumidos.get("home_team_id")
+    away_id = datos_resumidos.get("away_team_id")
+    partes.append(resumir_standings_v2_para_prompt(v2, home_id, away_id))
+
+    # Squads v2
+    partes.append(resumir_squads_v2_para_prompt(v2))
+
+    return "\n".join(p for p in partes if p.strip())
 
 
 def analizar_partido(datos_resumidos: dict, prediccion_resumida: dict) -> str:

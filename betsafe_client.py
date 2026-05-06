@@ -532,9 +532,8 @@ def _formatear_cuotas_betsafe_para_prompt(result: dict) -> str:
             r"^anotador en cualquier momento$",
         ],
         "Match Stats": [
-            r"^total de tiros \(2[3-9]\.5\)$",
-            r"^total de tiros al arco \([7-9]\.5\)$",
-            r"^total de tiros al arco \(10\.5\)$",
+            r"^total de tiros \(\d+(\.\d+)?\)$",
+            r"^total de tiros al arco \(\d+(\.\d+)?\)$",
         ],
         "Halves": [
             r"^1er tiempo - ganador$",
@@ -561,6 +560,12 @@ def _formatear_cuotas_betsafe_para_prompt(result: dict) -> str:
                         sels.append(f"{label}: @{odd}")
                     shown.append(f"  {mdata.get('name', mk)}: {' | '.join(sels)}")
         if shown:
+            # Sort Match Stats numerically by line value
+            if cat_key == "Match Stats":
+                def _sort_key(item):
+                    m = re.search(r'\((\d+(?:\.\d+)?)\)', item)
+                    return float(m.group(1)) if m else 999
+                shown.sort(key=_sort_key)
             cat_label = {
                 "1X2": "GANADOR", "Over/Under": "GOLES", "BTTS": "BTTS",
                 "Double Chance": "DOBLE OPORTUNIDAD", "Asian Handicap": "HANDICAP ASIATICO",

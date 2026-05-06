@@ -18,8 +18,10 @@ from bsd_client import (
     resumir_prediccion,
     depurar_partido,
 )
+from bsd_client_v2 import enriquecer_con_v2
 from sofascore_client import enriquecer_datos_partido, verificar_salud_sofascore, obtener_partidos_sofascore_only, obtener_datos_completos_sofascore
 from flashscore_client import enriquecer_datos_partido as enriquecer_flashscore
+from valuestats_client import enriquecer_arbitro_valuestats
 from betsafe_client import obtener_cuotas_betsafe, obtener_cuotas_betsafe_desde_url
 from analyzer import analizar_partido
 
@@ -143,6 +145,29 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
 
     prediccion_resumida = resumir_prediccion(prediccion)
 
+    # 3.5. Enriquecer con BSD v2 (managers, referee, stats, metadata, player-stats, standings, squads)
+    try:
+        datos_resumidos = enriquecer_con_v2(datos_resumidos, match_id)
+        v2 = datos_resumidos.get("_bsd_v2", {})
+        v2_parts = []
+        if v2.get("stats") and "_error" not in v2["stats"]:
+            v2_parts.append("stats (shotmap, momentum, xg_per_minute)")
+        if v2.get("metadata") and "_error" not in v2["metadata"]:
+            v2_parts.append("metadata (facts, AI preview)")
+        if v2.get("player_stats") and "_error" not in v2["player_stats"]:
+            v2_parts.append("player-stats")
+        if v2.get("standings") and "_error" not in v2["standings"]:
+            v2_parts.append("standings (xG)")
+        if v2_parts:
+            print(f"  \u2713 BSD v2: {', '.join(v2_parts)}")
+        # Actualizar prediccion si v2 devolvio una
+        prediccion_v2 = datos_resumidos.pop("_v2_prediction_raw", {})
+        if prediccion_v2 and not prediccion_resumida:
+            prediccion_resumida = resumir_prediccion(prediccion_v2)
+            print("  \u2713 Prediccion ML via BSD v2")
+    except Exception as e:
+        print(f"  \u26a0 BSD v2 enrichment: {e}")
+
     # 4. Enriquecer con SofaScore (alineaciones, arbitro, managers, lesiones, H2H, form)
     try:
         datos_resumidos = enriquecer_datos_partido(datos_resumidos)
@@ -175,6 +200,15 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
                 partes.append("tendencias equipos")
             if partes:
                 print(f"  \u2713 Flashscore: {', '.join(partes)}")
+    except Exception:
+        pass
+
+    # 5.5. Enriquecer arbitro con ValueStats (datos superiores a BSD v2 para tarjetas)
+    try:
+        datos_resumidos = enriquecer_arbitro_valuestats(datos_resumidos)
+        vs = (datos_resumidos.get("arbitro") or {}).get("_valuestats", {})
+        if vs:
+            print(f"  \u2713 ValueStats arbitro: {vs.get('yc_promedio', '?')} YC/part, {vs.get('total_partidos', '?')} partidos")
     except Exception:
         pass
 
@@ -262,6 +296,20 @@ def main():
 
             if datos is None:
                 print("\n  No se pudieron obtener los datos suficientes para el análisis.")
+                continue
+
+            # Si se pasa --show-prompt, muestra el prompt en vez de llamar a DeepSeek
+            if "--show-prompt" in sys.argv:
+                _separador()
+                from analyzer import SYSTEM_PROMPT, _crear_prompt_usuario
+                user_prompt = _crear_prompt_usuario(datos, prediccion)
+                print(f"=== SYSTEM PROMPT ({len(SYSTEM_PROMPT)} chars) ===")
+                print(SYSTEM_PROMPT)
+                print(f"\n=== USER PROMPT ({len(user_prompt)} chars) ===")
+                print(user_prompt)
+                print(f"\n=== TOTAL: {len(SYSTEM_PROMPT) + len(user_prompt)} chars enviados a DeepSeek ===")
+                _separador()
+                input("\n  Presioná Enter para continuar...")
                 continue
 
             print("\n  Consultando a DeepSeek para análisis de value betting...")
