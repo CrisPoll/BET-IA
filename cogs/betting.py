@@ -10,6 +10,8 @@ from bsd_client import (
     resumir_prediccion,
 )
 from sofascore_client import enriquecer_datos_partido as enriquecer_sofascore, verificar_salud_sofascore, obtener_partidos_sofascore_only, obtener_datos_completos_sofascore
+from flashscore_client import enriquecer_datos_partido as enriquecer_flashscore
+from betsafe_client import obtener_cuotas_betsafe, obtener_cuotas_betsafe_desde_url
 from analyzer import analizar_partido
 
 logger = logging.getLogger(__name__)
@@ -115,6 +117,7 @@ class BettingCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._match_cache: list = []
+        self._last_analysis: dict = {}  # {channel_id: {datos, prediccion, local, visitante}}
 
     @commands.command(name="partidos", aliases=["p"])
     async def partidos(self, ctx: commands.Context):
@@ -194,11 +197,16 @@ class BettingCog(commands.Cog):
                 await progress_msg.edit(content=f"\u274c SofaScore no disponible: {ss.get('error','?')}")
                 return
             prediccion_resumida = {}
+            try:
+                datos_resumidos = enriquecer_flashscore(datos_resumidos)
+            except Exception:
+                pass
             await progress_msg.edit(
                 content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
                 f"\u2713 SofaScore (datos completos)\n"
                 f"\u25ab 2/2 Consultando a DeepSeek..."
             )
+
         else:
             progress_msg = await channel.send(
                 f"\u23f3 Analizando **{local} vs {visitante}**...\n"
@@ -232,11 +240,32 @@ class BettingCog(commands.Cog):
                 datos_resumidos = enriquecer_sofascore(datos_resumidos)
             except Exception as e:
                 logger.warning(f"SofaScore fallo: {e}")
+            try:
+                datos_resumidos = enriquecer_flashscore(datos_resumidos)
+            except Exception:
+                pass
+            try:
+                partes = datos_resumidos.get("partido", "").split(" vs ")
+                home = partes[0].strip() if len(partes) > 0 else ""
+                away = partes[1].strip() if len(partes) > 1 else ""
+                if home and away:
+                    cuotas = obtener_cuotas_betsafe(home, away, datos_resumidos.get("liga", ""))
+                    if cuotas and "error" not in cuotas and cuotas.get("markets"):
+                        datos_resumidos["_cuotas"] = cuotas
+            except Exception:
+                pass
             await progress_msg.edit(
                 content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
                 f"\u2713 Datos del partido + prediccion ML + SofaScore\n"
                 f"\u25ab 3/3 Consultando a DeepSeek..."
             )
+
+        self._last_analysis[channel.id] = {
+            "datos": datos_resumidos,
+            "prediccion": prediccion_resumida,
+            "local": local,
+            "visitante": visitante,
+        }
 
         try:
             analisis = analizar_partido(datos_resumidos, prediccion_resumida)
@@ -248,6 +277,43 @@ class BettingCog(commands.Cog):
         chunks = _split_response(analisis)
         for chunk in chunks:
             await channel.send(chunk)
+
+    @commands.command(name="cuotas", aliases=["c"])
+    async def cuotas(self, ctx: commands.Context, url: str):
+        """Agrega cuotas de Betsafe al ultimo analisis y re-ejecuta DeepSeek.
+        Uso: !cuotas https://www.betsafe.pe/es/apuestas-deportivas?eventId=f-xxx&eti=0
+        """
+        last = self._last_analysis.get(ctx.channel.id)
+        if not last:
+            await ctx.send(
+                "No hay un analisis previo en este canal.\n"
+                "Usa `!partidos` o `!analizar <id>` primero."
+            )
+            return
+
+        async with ctx.typing():
+            cuotas = obtener_cuotas_betsafe_desde_url(url)
+            if "error" in cuotas:
+                await ctx.send(f"\u274c Error: {cuotas['error']}")
+                return
+
+            datos = last["datos"]
+            datos["_cuotas"] = cuotas
+            count = cuotas.get("total_markets", len(cuotas.get("markets", {})))
+            await ctx.send(
+                f"\u2705 {count} mercados de Betsafe cargados.\n"
+                f"Re-analizando **{last['local']} vs {last['visitante']}**..."
+            )
+
+            try:
+                analisis = analizar_partido(datos, last["prediccion"])
+            except Exception as e:
+                await ctx.send(f"\u274c Error al consultar la IA: {e}")
+                return
+
+            chunks = _split_response(analisis)
+            for chunk in chunks:
+                await ctx.send(chunk)
 
 
 def setup(bot: commands.Bot):

@@ -19,6 +19,8 @@ from bsd_client import (
     depurar_partido,
 )
 from sofascore_client import enriquecer_datos_partido, verificar_salud_sofascore, obtener_partidos_sofascore_only, obtener_datos_completos_sofascore
+from flashscore_client import enriquecer_datos_partido as enriquecer_flashscore
+from betsafe_client import obtener_cuotas_betsafe, obtener_cuotas_betsafe_desde_url
 from analyzer import analizar_partido
 
 logging.basicConfig(level=logging.INFO, format="  [%(levelname)s] %(message)s")
@@ -84,6 +86,12 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
             return None, None
 
         print("  \u2713 SofaScore (datos completos)")
+
+        # Flashscore enrichment
+        try:
+            datos_resumidos = enriquecer_flashscore(datos_resumidos)
+        except Exception:
+            pass
 
         # No hay prediccion BSD, construir una vacia
         prediccion_resumida = {}
@@ -155,6 +163,46 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
     except Exception as e:
         print(f"  \u26a0 SofaScore no disponible: {e}")
 
+    # 5. Enriquecer con Flashscore (tarjetas/arbitros)
+    try:
+        datos_resumidos = enriquecer_flashscore(datos_resumidos)
+        if datos_resumidos.get("_flashscore", {}).get("disponible"):
+            fs = datos_resumidos["_flashscore"]
+            partes = []
+            if fs.get("arbitro_stats"):
+                partes.append(f"arbitro ({fs['arbitro_stats'].get('promedio', '?')} YC/partido)")
+            if fs.get("equipo_stats"):
+                partes.append("tendencias equipos")
+            if partes:
+                print(f"  \u2713 Flashscore: {', '.join(partes)}")
+    except Exception:
+        pass
+
+    # 6. Obtener cuotas Betsafe en tiempo real
+    try:
+        partes = datos_resumidos.get("partido", "").split(" vs ")
+        home = partes[0].strip() if len(partes) > 0 else ""
+        away = partes[1].strip() if len(partes) > 1 else ""
+        liga = datos_resumidos.get("liga", "")
+        if home and away:
+            cuotas = obtener_cuotas_betsafe(home, away, liga)
+            if cuotas and "error" not in cuotas and cuotas.get("markets"):
+                datos_resumidos["_cuotas"] = cuotas
+                print(f"  \u2713 Betsafe: {len(cuotas.get('markets', {}))} mercados en tiempo real")
+            else:
+                print(f"  \u26a0 Betsafe no encontro el partido automaticamente")
+                print(f"     Si tenes la URL de Betsafe, pega el link o eventId (o Enter para omitir):")
+                url = input("     > ").strip()
+                if url:
+                    cuotas = obtener_cuotas_betsafe_desde_url(url)
+                    if cuotas and "error" not in cuotas and cuotas.get("markets"):
+                        datos_resumidos["_cuotas"] = cuotas
+                        print(f"     \u2713 Betsafe: {len(cuotas.get('markets', {}))} mercados en tiempo real")
+                    else:
+                        print(f"     \u2717 Error: {cuotas.get('error', '?')}")
+    except Exception:
+        pass
+
     if verbose:
         depurar_partido(datos_resumidos, prediccion_resumida)
 
@@ -184,8 +232,8 @@ def main():
         opcion = input("\n  Opción: ").strip()
 
         if opcion == "1":
-            print("\n  Cargando próximos partidos de ligas europeas y torneos internacionales...")
-            print("  (Brasileirao, Premier League, La Liga, Bundesliga + Liga 1 Peru)")
+            print("\n  Cargando próximos partidos de ligas europeas, torneos internacionales y sudamericanos...")
+            print("  (Brasileirao, Premier League, La Liga, Bundesliga + UCL, Libertadores, Sudamericana + Liga 1 Peru)")
             try:
                 verificar_salud_sofascore(detallado=True)
                 partidos_cache = obtener_proximos_partidos()
