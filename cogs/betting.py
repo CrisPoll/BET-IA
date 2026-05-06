@@ -12,8 +12,7 @@ from bsd_client import (
 from bsd_client_v2 import enriquecer_con_v2
 from sofascore_client import enriquecer_datos_partido as enriquecer_sofascore, verificar_salud_sofascore, obtener_partidos_sofascore_only, obtener_datos_completos_sofascore
 from flashscore_client import enriquecer_datos_partido as enriquecer_flashscore
-from valuestats_client import enriquecer_arbitro_valuestats
-from betsafe_client import obtener_cuotas_betsafe, obtener_cuotas_betsafe_desde_url
+from betsafe_client import obtener_cuotas_betsafe_desde_url
 from analyzer import analizar_partido
 
 logger = logging.getLogger(__name__)
@@ -256,20 +255,6 @@ class BettingCog(commands.Cog):
                 logger.warning(f"SofaScore fallo: {e}")
             try:
                 datos_resumidos = enriquecer_flashscore(datos_resumidos)
-            except Exception:
-                pass
-            try:
-                datos_resumidos = enriquecer_arbitro_valuestats(datos_resumidos)
-            except Exception:
-                pass
-            try:
-                partes = datos_resumidos.get("partido", "").split(" vs ")
-                home = partes[0].strip() if len(partes) > 0 else ""
-                away = partes[1].strip() if len(partes) > 1 else ""
-                if home and away:
-                    cuotas = obtener_cuotas_betsafe(home, away, datos_resumidos.get("liga", ""))
-                    if cuotas and "error" not in cuotas and cuotas.get("markets"):
-                        datos_resumidos["_cuotas"] = cuotas
             except Exception:
                 pass
             await progress_msg.edit(
