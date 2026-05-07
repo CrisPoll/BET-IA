@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import re
 import discord
 from discord.ext import commands
 
@@ -34,11 +36,24 @@ def _split_response(text: str, limit: int = DISCORD_MSG_LIMIT) -> list:
     return chunks
 
 
+def _parse_urls(args: str) -> tuple:
+    """Parsea URLs de Betsafe y arbitro desde string de argumentos."""
+    betsafe_url = ""
+    arbitro_url = ""
+    words = args.strip().split()
+    for w in words:
+        w = w.strip()
+        if "betsafe" in w:
+            betsafe_url = w
+        elif "whoscored" in w or "transfermarkt" in w:
+            arbitro_url = w
+    return betsafe_url, arbitro_url
+
+
 class MatchSelectView(discord.ui.View):
-    def __init__(self, matches: list, analyze_callback):
+    def __init__(self, matches: list):
         super().__init__(timeout=600)
         self.matches = matches
-        self.analyze_callback = analyze_callback
         self.page = 0
         self._build()
 
@@ -49,7 +64,7 @@ class MatchSelectView(discord.ui.View):
         end = start + PER_PAGE
 
         select = discord.ui.Select(
-            placeholder="Selecciona un partido para analizar...",
+            placeholder="Selecciona un partido...",
             min_values=1,
             max_values=1,
         )
@@ -93,15 +108,20 @@ class MatchSelectView(discord.ui.View):
         match_id = int(interaction.data["values"][0])
         match = next((m for m in self.matches if m.get("id") == match_id), None)
         if not match:
-            await interaction.response.send_message(
-                "Partido no encontrado.", ephemeral=True
-            )
+            await interaction.response.send_message("Partido no encontrado.", ephemeral=True)
             return
         self.stop()
+        local = match.get("home_team", "?")
+        visitante = match.get("away_team", "?")
         await interaction.response.edit_message(
-            content="\u2705 Analizando partido seleccionado...", view=None
+            content=(
+                f"**{local} vs {visitante}** (ID: `{match_id}`)\n"
+                f"Usa el comando:\n"
+                f"`!a {match_id} <url_betsafe> <url_arbitro>`\n"
+                f"Ejemplo: `!a {match_id} https://www.betsafe.pe/...?eventId=f-... https://es.whoscored.com/referees/...`"
+            ),
+            view=None,
         )
-        await self.analyze_callback(interaction.channel, match)
 
     async def _prev(self, interaction: discord.Interaction):
         self.page -= 1
@@ -118,7 +138,6 @@ class BettingCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._match_cache: list = []
-        self._last_analysis: dict = {}  # {channel_id: {datos, prediccion, local, visitante}}
 
     @commands.command(name="partidos", aliases=["p"])
     async def partidos(self, ctx: commands.Context):
@@ -132,33 +151,31 @@ class BettingCog(commands.Cog):
             except Exception as e:
                 await ctx.send(
                     f"\u274c Error al obtener partidos: {e}\n"
-                    "Verifica que `BSD_API_KEY` esté configurada en `.env`."
+                    "Verifica que `BSD_API_KEY` este configurada en `.env`."
                 )
                 return
 
             if not self._match_cache:
-                await ctx.send(
-                    "No hay próximos partidos disponibles en este momento."
-                )
+                await ctx.send("No hay proximos partidos disponibles en este momento.")
                 return
 
         total = len(self._match_cache)
-        view = MatchSelectView(self._match_cache, self._analyze_match)
+        view = MatchSelectView(self._match_cache)
         await ctx.send(
-            f"**Próximos partidos** ({total} encontrados)\n"
-            "Selecciona uno del menú desplegable para analizar:",
+            f"**Proximos partidos** ({total} encontrados)\n"
+            "Selecciona uno para ver el comando de analisis:",
             view=view,
         )
 
     @commands.command(name="analizar", aliases=["a"])
-    async def analizar(self, ctx: commands.Context, match_id: int):
+    async def analizar(self, ctx: commands.Context, match_id: int, *, args: str = ""):
+        betsafe_url, arbitro_url = _parse_urls(args) if args else ("", "")
+
         async with ctx.typing():
             try:
                 detalle = obtener_detalle_partido(match_id)
             except Exception as e:
-                await ctx.send(
-                    f"\u274c Error al obtener el partido {match_id}: {e}"
-                )
+                await ctx.send(f"\u274c Error al obtener el partido {match_id}: {e}")
                 return
 
             local = detalle.get("home_team", "?")
@@ -168,155 +185,114 @@ class BettingCog(commands.Cog):
                 "id": match_id,
                 "home_team": local,
                 "away_team": visitante,
-                "_league_name": detalle.get("_league_name")
-                or detalle.get("league", {}).get("name", "?"),
+                "_league_name": detalle.get("_league_name") or detalle.get("league", {}).get("name", "?"),
                 "league": detalle.get("league", {}),
             }
 
-            await self._analyze_match(ctx, match)
+            await self._analyze_match(ctx, match, betsafe_url, arbitro_url)
 
-    async def _analyze_match(
-        self, channel: discord.abc.Messageable, match: dict
-    ):
+    async def _analyze_match(self, channel, match: dict, betsafe_url: str = "", arbitro_url: str = ""):
         match_id = match.get("id")
         local = match.get("home_team", "?")
         visitante = match.get("away_team", "?")
         es_sofascore_only = match.get("_source") == "sofascore_only"
 
-        if es_sofascore_only:
-            progress_msg = await channel.send(
-                f"\u23f3 Analizando **{local} vs {visitante}**...\n"
-                f"\u25ab 1/2 Obteniendo datos via SofaScore..."
-            )
-            try:
-                datos_resumidos = obtener_datos_completos_sofascore(match)
-            except Exception as e:
-                await progress_msg.edit(content=f"\u274c Error: {e}")
-                return
-            ss = datos_resumidos.get("_sofascore", {})
-            if not ss.get("disponible"):
-                await progress_msg.edit(content=f"\u274c SofaScore no disponible: {ss.get('error','?')}")
-                return
-            prediccion_resumida = {}
-            try:
-                datos_resumidos = enriquecer_flashscore(datos_resumidos)
-            except Exception:
-                pass
-            await progress_msg.edit(
-                content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
-                f"\u2713 SofaScore (datos completos)\n"
-                f"\u25ab 2/2 Consultando a DeepSeek..."
-            )
+        total_steps = 3 if es_sofascore_only else 5
+        step = 0
 
-        else:
-            progress_msg = await channel.send(
-                f"\u23f3 Analizando **{local} vs {visitante}**...\n"
-                f"\u25ab 1/3 Obteniendo datos del partido..."
-            )
-            try:
-                detalle = obtener_detalle_partido(match_id)
-            except Exception as e:
-                await progress_msg.edit(content=f"\u274c Error al obtener detalle del partido: {e}")
-                return
-            try:
-                predicciones = obtener_predicciones(match_id=match_id)
-                if predicciones:
-                    prediccion = predicciones[0]
-                else:
-                    league_id = match.get("league", {}).get("id")
-                    predicciones = obtener_predicciones(league_id=league_id)
-                    prediccion = predicciones[0] if predicciones else {}
-            except Exception as e:
-                logger.warning(f"Error obteniendo predicciones: {e}")
-                prediccion = {}
-            datos_resumidos = resumir_datos_partido(detalle)
-            datos_resumidos["partido"] = f"{detalle.get('home_team', local)} vs {detalle.get('away_team', visitante)}"
-            prediccion_resumida = resumir_prediccion(prediccion)
-            await progress_msg.edit(
-                content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
-                f"\u2713 Datos del partido + prediccion ML\n"
-                f"\u25ab 2/4 Enrichiendo con BSD v2..."
-            )
-            try:
-                datos_resumidos = enriquecer_con_v2(datos_resumidos, match_id)
-                prediccion_v2 = datos_resumidos.pop("_v2_prediction_raw", {})
-                if prediccion_v2 and not prediccion_resumida:
-                    prediccion_resumida = resumir_prediccion(prediccion_v2)
-            except Exception as e:
-                logger.warning(f"BSD v2 enrichment fallo: {e}")
-            await progress_msg.edit(
-                content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
-                f"\u2713 Datos del partido + prediccion ML + BSD v2\n"
-                f"\u25ab 3/4 Enrichiendo con SofaScore..."
-            )
-            try:
-                datos_resumidos = enriquecer_sofascore(datos_resumidos)
-            except Exception as e:
-                logger.warning(f"SofaScore fallo: {e}")
-            try:
-                datos_resumidos = enriquecer_flashscore(datos_resumidos)
-            except Exception:
-                pass
-            await progress_msg.edit(
-                content=f"\u23f3 Analizando **{local} vs {visitante}**...\n"
-                f"\u2713 Datos del partido + prediccion ML + BSD v2 + SofaScore\n"
-                f"\u25ab 4/4 Consultando a DeepSeek..."
-            )
+        progress_msg = await channel.send(
+            f"\u23f3 Analizando **{local} vs {visitante}**..."
+        )
 
-        self._last_analysis[channel.id] = {
-            "datos": datos_resumidos,
-            "prediccion": prediccion_resumida,
-            "local": local,
-            "visitante": visitante,
-        }
+        async def _update(text: str):
+            nonlocal step
+            step += 1
+            lines = progress_msg.content.split("\n")
+            lines.append(f"\u25ab {step}/{total_steps} {text}")
+            await progress_msg.edit(content="\n".join(lines))
+
+        datos_resumidos = None
+        prediccion_resumida = {}
 
         try:
-            analisis = analizar_partido(datos_resumidos, prediccion_resumida)
+            if es_sofascore_only:
+                await _update("Obteniendo datos via SofaScore...")
+                datos_resumidos = obtener_datos_completos_sofascore(match)
+                ss = datos_resumidos.get("_sofascore", {})
+                if not ss.get("disponible"):
+                    await progress_msg.edit(content=f"\u274c SofaScore no disponible: {ss.get('error','?')}")
+                    return
+            else:
+                await _update("Obteniendo datos BSD + prediccion ML...")
+                detalle = obtener_detalle_partido(match_id)
+                try:
+                    predicciones = obtener_predicciones(match_id=match_id)
+                    if predicciones:
+                        prediccion = predicciones[0]
+                    else:
+                        league_id = match.get("league", {}).get("id")
+                        predicciones = obtener_predicciones(league_id=league_id)
+                        prediccion = predicciones[0] if predicciones else {}
+                except Exception:
+                    prediccion = {}
+
+                datos_resumidos = resumir_datos_partido(detalle)
+                datos_resumidos["partido"] = f"{detalle.get('home_team', local)} vs {detalle.get('away_team', visitante)}"
+                prediccion_resumida = resumir_prediccion(prediccion)
+
+                await _update("Enriqueciendo con BSD v2...")
+                try:
+                    datos_resumidos = enriquecer_con_v2(datos_resumidos, match_id)
+                    prediccion_v2 = datos_resumidos.pop("_v2_prediction_raw", {})
+                    if prediccion_v2 and not prediccion_resumida:
+                        prediccion_resumida = resumir_prediccion(prediccion_v2)
+                except Exception:
+                    pass
+
+                await _update("Enriqueciendo con SofaScore...")
+                try:
+                    datos_resumidos = enriquecer_sofascore(datos_resumidos)
+                except Exception:
+                    pass
+                try:
+                    datos_resumidos = enriquecer_flashscore(datos_resumidos)
+                except Exception:
+                    pass
+
+            # Betsafe
+            if betsafe_url:
+                await _update("Obteniendo cuotas Betsafe...")
+                try:
+                    cuotas = await asyncio.to_thread(obtener_cuotas_betsafe_desde_url, betsafe_url)
+                    if cuotas and "error" not in cuotas and cuotas.get("markets"):
+                        datos_resumidos["_cuotas"] = cuotas
+                except Exception:
+                    pass
+
+            # Arbitro WhoScored / Transfermarkt
+            if arbitro_url:
+                await _update("Scrapeando datos del arbitro...")
+                try:
+                    if "whoscored" in arbitro_url:
+                        from whoscored_client import enriquecer_arbitro_whoscored
+                        datos_resumidos = await asyncio.to_thread(enriquecer_arbitro_whoscored, datos_resumidos, arbitro_url)
+                    elif "transfermarkt" in arbitro_url:
+                        from transfermarkt_client import enriquecer_arbitro_transfermarkt
+                        datos_resumidos = await asyncio.to_thread(enriquecer_arbitro_transfermarkt, datos_resumidos, arbitro_url)
+                except Exception:
+                    pass
+
+            await _update("Consultando a DeepSeek...")
+            analisis = await asyncio.to_thread(analizar_partido, datos_resumidos, prediccion_resumida)
+
         except Exception as e:
-            await progress_msg.edit(content=f"\u274c Error al consultar la IA: {e}")
+            await progress_msg.edit(content=f"\u274c Error: {e}")
             return
 
         await progress_msg.edit(content=f"\u2705 Analisis completado: **{local} vs {visitante}**")
         chunks = _split_response(analisis)
         for chunk in chunks:
             await channel.send(chunk)
-
-    @commands.command(name="cuotas", aliases=["c"])
-    async def cuotas(self, ctx: commands.Context, url: str):
-        """Agrega cuotas de Betsafe al ultimo analisis y re-ejecuta DeepSeek.
-        Uso: !cuotas https://www.betsafe.pe/es/apuestas-deportivas?eventId=f-xxx&eti=0
-        """
-        last = self._last_analysis.get(ctx.channel.id)
-        if not last:
-            await ctx.send(
-                "No hay un analisis previo en este canal.\n"
-                "Usa `!partidos` o `!analizar <id>` primero."
-            )
-            return
-
-        async with ctx.typing():
-            cuotas = obtener_cuotas_betsafe_desde_url(url)
-            if "error" in cuotas:
-                await ctx.send(f"\u274c Error: {cuotas['error']}")
-                return
-
-            datos = last["datos"]
-            datos["_cuotas"] = cuotas
-            count = cuotas.get("total_markets", len(cuotas.get("markets", {})))
-            await ctx.send(
-                f"\u2705 {count} mercados de Betsafe cargados.\n"
-                f"Re-analizando **{last['local']} vs {last['visitante']}**..."
-            )
-
-            try:
-                analisis = analizar_partido(datos, last["prediccion"])
-            except Exception as e:
-                await ctx.send(f"\u274c Error al consultar la IA: {e}")
-                return
-
-            chunks = _split_response(analisis)
-            for chunk in chunks:
-                await ctx.send(chunk)
 
 
 def setup(bot: commands.Bot):

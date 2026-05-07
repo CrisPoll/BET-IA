@@ -28,16 +28,14 @@ from flashscore_client import (
     _formatear_standings_flashscore_para_prompt,
 )
 from betsafe_client import _formatear_cuotas_betsafe_para_prompt
-from valuestats_client import formatear_arbitro_valuestats_para_prompt
 from whoscored_client import formatear_arbitro_whoscored_para_prompt
+from transfermarkt_client import formatear_arbitro_transfermarkt_para_prompt
 from bsd_client_v2 import (
     resumir_stats_v2_para_prompt,
     resumir_metadata_v2_para_prompt,
     resumir_player_stats_v2_para_prompt,
     resumir_standings_v2_para_prompt,
     resumir_squads_v2_para_prompt,
-    resumir_manager_v2_para_prompt,
-    resumir_arbitro_v2_para_prompt,
 )
 
 load_dotenv()
@@ -68,26 +66,24 @@ REGLAS DE PONDERACION OBLIGATORIAS:
 - Los partidos de H2H de mas de 3 anios atras son irrelevantes (plantillas y estilos cambiaron).
 - Si el H2H proviene de Champions League pero los equipos nunca se enfrentaron con estas plantillas, dale peso BAJO.
 - LESIONES/SUSPENSIONES (BSD): Los datos de bajas vienen de BSD. Usalos como REFERENCIA pero con PRECAUCION: BSD no siempre es preciso. Si un jugador aparece como lesionado en BSD pero SofaScore lo pone titular, SofaScore MANDA -> el jugador JUEGA.
-- ARBITRO: Los datos del arbitro incluyen promedios por partido (amarillas, faltas, goles) via BSD v2. Son la referencia principal para estimar tarjetas. Si no estan disponibles, usa los promedios historicos de carrera como referencia secundaria.
+- ARBITRO: Los datos del arbitro se obtienen de WhoScored/Transfermarkt (si el usuario los proporciona), o de BSD v2 como fallback automatico. La seccion DATOS ADICIONALES muestra la fuente mas completa disponible. Usa el promedio de la competicion del partido actual, no el total de carrera.
 
 REGLAS DE REMATES (TIROS):
-- La fuente principal son los promedios de BSD en la seccion FORMA (remates_promedio, remates_arco_promedio).
-- Si hay datos BSD v2 de stats (total_shots, attack, dangerous_attack, pass_accuracy_pct), incorporalos al analisis de intensidad ofensiva.
+- La fuente principal son los datos por partido en FORMA RECIENTE (tiros totales, al arco, corners) y los promedios de BSD (remates_promedio, remates_arco_promedio).
+- Evalua la CONSISTENCIA: no es lo mismo un equipo que mete 25 tiros siempre que uno que alterna 8 y 25. Mira el desglose.
+- Compara los tiros en Copa/Libertadores vs Liga del equipo: si en copa mete menos tiros contra rivales fuertes, ajusta expectativas.
 - SI HAY DATOS DE SHOTMAP (xG por disparo) desde BSD v2 o SofaScore, usalos para evaluar la calidad de las ocasiones.
-- SI HAY DATOS DE JUGADORES con tiros y xG individual (BSD v2 player-stats), considera quien genera y quien esta en racha.
-- El xg_per_minute de BSD v2 muestra en que momentos del partido los equipos generan peligro. Usalo para patrones de gol.
 - Equipos con alto xG + alto volumen de remates al arco -> partido intenso ofensivamente.
 - Si ambos equipos promedian >10 remates y >4 al arco -> Over 2.5 gana peso adicional.
-- Si ambos equipos generan pocos remates al arco (<3) -> Under 2.5 gana peso.
+- Cruza con las cuotas de tiros de Betsafe para detectar edges en mercados de tiros totales/arco.
 
 REGLAS DE MOMENTUM:
 - Si esta disponible el grafico de momentum de SofaScore, usalo para entender quien domino el partido.
 - El momentum mide dominio acumulado minuto a minuto (no solo posesion, sino presion ofensiva).
 
 REGLAS DE TARJETAS Y ARBITRO:
-- La fuente PRINCIPAL para datos de arbitro es WhoScored (si esta disponible): desglose por competicion, YC/partido, RC/partido, faltas/partido.
-- Si WhoScored NO esta disponible, usa ValueStats como alternativa.
-- Si ninguno esta disponible, usa BSD v2 (avg_yellow_per_match, avg_fouls_per_match) como referencia.
+- La fuente PRINCIPAL para datos de arbitro es WhoScored/Transfermarkt (si estan disponibles): desglose por competicion, YC/partido, RC/partido, faltas/partido.
+- Si no hay WhoScored/Transfermarkt, usa BSD v2 (avg_yellow_per_match, avg_fouls_per_match) como referencia.
 - SI HAY DATOS FLASHSCORE del arbitro, cruzalos con los datos de WhoScored/ValueStats.
 - IMPORTANTE: Si WhoScored muestra YC/partido distintos en liga local vs Champions League, usa el promedio de la competicion del partido actual, no el total.
 - Derbis y partidos de alta rivalidad -> mas tarjetas esperadas.
@@ -111,10 +107,12 @@ REGLAS DE OVER/UNDER y BTTS:
 - No uses el argumento "H2H historico under" si los equipos actuales juegan distinto.
 - COMPETICION: Si la forma reciente del equipo proviene de su liga local contra rivales inferiores (ej: PSG vs Le Havre), penaliza esas metricas al proyectar contra un rival de elite en Champions. Las estadisticas infladas por goleadas a equipos debiles NO se transfieren a partidos de maxima exigencia.
 - VARIANZA: No te fies solo del promedio. Mira el desglose por partido. Si un equipo metio 17 goles en 5 partidos pero 9 fueron en un solo partido contra un rival debil, su promedio real de goles es ~2.0, no 3.4. Penaliza los outliers.
+- TABLA DE POSICIONES: Usa la posicion en la tabla como contexto del momento del equipo. Un equipo puntero en su liga local pero colista en el grupo de copa indica que rinde distinto segun la competicion. Si la tabla muestra xG a favor/en contra, comparalos con los goles reales para detectar overperformance/underperformance.
 
 REGLAS DE CUOTAS:
 - Las cuotas de BETSAFE son las OFICIALES. Usalas para calcular valor.
 - Ignora cualquier otra cuota (BSD) que pueda aparecer. Betsafe manda.
+- MERCADOS DE TIROS: Si Betsafe tiene Over con cuota <1.35 en tiros totales o tiros al arco, el mercado ya descuenta volumen alto. No recomiendes Under en esos casos a menos que tengas data MUY solida que lo justifique (ej: ambos equipos promedian <8 tiros O <2 al arco en los ultimos 5 partidos de ESTA competicion). El error mas comun es subestimar el ritmo de juego en Sudamerica — los partidos de eliminacion directa y liga local generan mas volumen que la fase de grupos de copa.
 
 SE CONSERVADOR: Prefiere quedarte corto en edges a inflarlos artificialmente.
 
@@ -132,15 +130,13 @@ FORMATO DE RESPUESTA (se conciso, no repitas datos):
 
 [TIROS Y REMATES]
 Estimacion de tiros totales y al arco (promedio esperado para el partido).
-Justificacion: basada en estilo de juego y promedios de cada equipo.
-Si hay datos de shotmap/xG individual, incorporalos en la justificacion.
+Justificacion: basada en los datos por partido de la seccion FORMA RECIENTE y cuotas de Betsafe.
 
 [TARJETAS]
 Amarillas esperadas (rango bajo/medio/alto). Menciona al arbitro si esta asignado.
-Usa datos Flashscore del arbitro si estan disponibles.
 
 [CORNERS]
-Estimacion de corners totales. Si no hay datos, menciona e infiere del estilo.
+Estimacion de corners totales basada en datos por partido (FORMA RECIENTE) y cuotas de Betsafe.
 
 [EDGE]
 Tabla: Mercado | Seleccion | Cuota | Prob.Real | Prob.Implicita | Edge | Confianza
@@ -148,8 +144,23 @@ Tabla: Mercado | Seleccion | Cuota | Prob.Real | Prob.Implicita | Edge | Confian
 
 [RECOMENDACION]
 Mejor apuesta con valor (1-2 lineas). Si no hay valor, dilo.
-Si hay contexto favorable para tiros/amarillas/corners, menciona como nota adicional."""
+Si hay contexto favorable para tiros/amarillas/corners, menciona como nota adicional.
+Si el mercado de Betsafe marca Over con cuota muy baja (<1.35), alineate con el mercado salvo evidencia abrumadora en contra."""
 
+
+
+def _formatear_forma_bsd_compact(datos: dict) -> str:
+    """Formato compacto de la forma BSD (solo promedios clave, sin JSON verboso)."""
+    partes = []
+    for lado, key in [("Local", "forma_local"), ("Visitante", "forma_visitante")]:
+        f = datos.get(key, {})
+        if not f:
+            continue
+        linea = f"{lado}: {f.get('forma_string', '?')} | xG: {f.get('xG_promedio', '?')} | xGc: {f.get('xG_contra_promedio', '?')} | "
+        linea += f"Tiros: {f.get('remates_promedio', '?')}/part | Arco: {f.get('remates_arco_promedio', '?')}/part | "
+        linea += f"YC: {f.get('amarillas_promedio', '?')}/part | Faltas: {f.get('faltas_promedio', '?')}/part"
+        partes.append(linea)
+    return "\n".join(partes)
 
 
 def _crear_prompt_usuario(datos_resumidos: dict, prediccion_resumida: dict) -> str:
@@ -186,23 +197,20 @@ Fecha: {datos_resumidos.get('fecha', 'Desconocida')}
 - BTTS Si: {datos_resumidos['cuotas'].get('btts_si', 'N/D')}
 - BTTS No: {datos_resumidos['cuotas'].get('btts_no', 'N/D')}'''}
 
-### FORMA LOCAL ({datos_resumidos['partido'].split(' vs ')[0]})
-- Últimos partidos: {json.dumps(datos_resumidos.get('forma_local', {}), indent=2, ensure_ascii=False)}
-
-### FORMA VISITANTE ({datos_resumidos['partido'].split(' vs ')[1] if ' vs ' in datos_resumidos.get('partido', '') else '?'})
-- Últimos partidos: {json.dumps(datos_resumidos.get('forma_visitante', {}), indent=2, ensure_ascii=False)}
+### FORMA BSD (agregados)
+{_formatear_forma_bsd_compact(datos_resumidos)}
 
 ### HEAD TO HEAD (últimos 3 años)
 - NOTA: Solo se muestran enfrentamientos recientes. El H2H antiguo (>3 años) fue excluido porque las plantillas y estilos cambiaron.
 {f"- {json.dumps(datos_resumidos.get('h2h', {}), indent=2, ensure_ascii=False)}" if datos_resumidos.get('h2h') and datos_resumidos['h2h'].get('total_partidos') else "- No hay enfrentamientos previos registrados entre estos equipos. Ignora el factor H2H para este analisis."}
 
 ### NOTA SOBRE DATOS DISPONIBLES
-- REMATES Y TIROS: Usa los promedios de BSD en la seccion FORMA (remates_promedio, remates_arco_promedio).
-- AMARILLAS: Usa amarillas_promedio y faltas_promedio de BSD. Cruza esto con la info del arbitro.
-- CORNERS: No hay datos de corners por equipo en las APIs disponibles. Haz una inferencia cualitativa basada en estilo de juego (equipos de posesion alta y muchos remates generan mas corners).
-- POSESION: Infiere del estilo de juego y perfil de los entrenadores.
-- FATIGA: No hay datos exactos de fechas de ultimos partidos. Usa el PPG y la forma reciente como proxy de fatiga/ritmo. Equipos con alta carga de partidos (Champions + Liga) suelen rotar mas.
-- LESIONES: SofaScore YA NO proporciona datos de lesiones via API. Usa BAJAS BSD como referencia secundaria con PRECAUCION. La alineacion de SofaScore es quien define quien JUEGA.
+- REMATES Y TIROS: La seccion FORMA RECIENTE muestra tiros totales, al arco, amarillas y corners por partido. Complementa con los promedios de BSD (remates_promedio, remates_arco_promedio).
+- AMARILLAS: La seccion FORMA RECIENTE muestra YC por partido. Cruza con los datos del arbitro en DATOS ADICIONALES.
+- CORNERS: La seccion FORMA RECIENTE muestra corners por partido. Complementa con las cuotas de corners de Betsafe.
+- COMPETICION: La forma reciente esta separada por torneo (Copa/Torneo vs Liga). Evalua el rendimiento en la competicion actual del partido.
+- FATIGA: Usa el PPG y la forma reciente como proxy de fatiga/ritmo.
+- LESIONES: SofaScore YA NO proporciona datos de lesiones via API. Usa BAJAS BSD como referencia secundaria. La alineacion de SofaScore es quien define quien JUEGA.
 
 ### ALINEACION DEL PARTIDO (SofaScore)
 - La alineacion de SofaScore es la unica fuente de disponibilidad de jugadores.
@@ -229,11 +237,12 @@ Fecha: {datos_resumidos.get('fecha', 'Desconocida')}
 - Marcador más probable: {prediccion_resumida.get('marcador_probable', 'N/D')}
 - Confianza del modelo: {prediccion_resumida.get('confianza_modelo', 'N/D')}
 
----
-Analiza los datos anteriores y proporciona tu evaluación de value betting siguiendo el formato establecido.
+### TABLA DE POSICIONES
+{_format_standings_section(datos_resumidos)}
 
-    {_formatear_standings_para_prompt(datos_resumidos)}
-    {_formatear_standings_flashscore_para_prompt(datos_resumidos)}
+---
+Analiza los datos anteriores y proporciona tu evaluacion de value betting siguiendo el formato establecido.
+
     {_formatear_detalle_evento_para_prompt(datos_resumidos)}
     {_formatear_h2h_sofascore_para_prompt(datos_resumidos)}
     {_formatear_alineaciones_para_prompt(datos_resumidos)}
@@ -252,6 +261,27 @@ Analiza los datos anteriores y proporciona tu evaluación de value betting sigui
 {_v2_sections(datos_resumidos)}
 """
     return prompt
+
+
+def _format_standings_section(datos_resumidos: dict) -> str:
+    """Muestra standings de todas las fuentes, o mensaje si no hay."""
+    partes = [
+        _formatear_standings_para_prompt(datos_resumidos),
+        _formatear_standings_flashscore_para_prompt(datos_resumidos),
+        _v2_standings_section(datos_resumidos),
+    ]
+    content = "\n".join(p for p in partes if p.strip())
+    return content if content.strip() else "(No hay tabla de posiciones disponible para este partido)"
+
+
+def _v2_standings_section(datos_resumidos: dict) -> str:
+    """Standings desde BSD v2, mostrados en la seccion principal."""
+    v2 = datos_resumidos.get("_bsd_v2", {})
+    if not v2:
+        return ""
+    home_id = datos_resumidos.get("home_team_id")
+    away_id = datos_resumidos.get("away_team_id")
+    return resumir_standings_v2_para_prompt(v2, home_id, away_id)
 
 
 def _v2_sections(datos_resumidos: dict) -> str:
@@ -284,11 +314,11 @@ def _v2_sections(datos_resumidos: dict) -> str:
     # Stats v2
     partes.append(resumir_stats_v2_para_prompt(v2))
 
-    # ValueStats arbitro
-    partes.append(formatear_arbitro_valuestats_para_prompt(datos_resumidos))
-
     # WhoScored arbitro
     partes.append(formatear_arbitro_whoscored_para_prompt(datos_resumidos))
+
+    # Transfermarkt arbitro
+    partes.append(formatear_arbitro_transfermarkt_para_prompt(datos_resumidos))
 
     # Player stats v2
     partes.append(resumir_player_stats_v2_para_prompt(v2))
@@ -296,15 +326,38 @@ def _v2_sections(datos_resumidos: dict) -> str:
     # Metadata v2
     partes.append(resumir_metadata_v2_para_prompt(v2))
 
-    # Standings v2
-    home_id = datos_resumidos.get("home_team_id")
-    away_id = datos_resumidos.get("away_team_id")
-    partes.append(resumir_standings_v2_para_prompt(v2, home_id, away_id))
-
     # Squads v2
     partes.append(resumir_squads_v2_para_prompt(v2))
 
     return "\n".join(p for p in partes if p.strip())
+
+
+def _call_deepseek(client, prompt_usuario: str, include_reasoning: bool = True) -> tuple:
+    """Llama a DeepSeek y retorna (contenido, razonamiento)."""
+    extra_body = {}
+    if include_reasoning:
+        extra_body["include_reasoning"] = True
+
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt_usuario},
+        ],
+        max_tokens=MAX_TOKENS,
+        temperature=TEMPERATURE,
+        extra_headers={
+            "HTTP-Referer": "https://github.com/betting-ai",
+            "X-Title": "Betting AI - Value Betting Analyzer",
+        },
+        extra_body=extra_body,
+    )
+
+    finish_reason = response.choices[0].finish_reason
+    razonamiento = getattr(response.choices[0].message, "reasoning_content", None) or ""
+    contenido = response.choices[0].message.content
+
+    return contenido, razonamiento, finish_reason
 
 
 def analizar_partido(datos_resumidos: dict, prediccion_resumida: dict) -> str:
@@ -334,39 +387,23 @@ def analizar_partido(datos_resumidos: dict, prediccion_resumida: dict) -> str:
 
     prompt_usuario = _crear_prompt_usuario(datos_resumidos, prediccion_resumida)
 
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt_usuario},
-        ],
-        max_tokens=MAX_TOKENS,
-        temperature=TEMPERATURE,
-        extra_headers={
-            "HTTP-Referer": "https://github.com/betting-ai",
-            "X-Title": "Betting AI - Value Betting Analyzer",
-        },
-        extra_body={
-            "include_reasoning": True,
-        },
-    )
+    # Primer intento: con reasoning
+    contenido, razonamiento, finish_reason = _call_deepseek(client, prompt_usuario, include_reasoning=True)
 
-    finish_reason = response.choices[0].finish_reason
-    if finish_reason == "length":
-        raise RuntimeError(
-            f"Respuesta truncada (finish_reason='length'). "
-            f"Aumenta MAX_TOKENS (actual: {MAX_TOKENS})"
-        )
+    # Si no hay contenido visible (reasoning consumió todos los tokens), reintentar sin reasoning
+    if contenido is None:
+        print("\n  [DeepSeek agotó tokens en razonamiento, reintentando sin reasoning...]")
+        contenido, razonamiento, finish_reason = _call_deepseek(client, prompt_usuario, include_reasoning=False)
 
-    razonamiento = getattr(response.choices[0].message, "reasoning_content", None) or ""
-    razonamiento = getattr(response.choices[0].message, "reasoning_content", None) or ""
-    contenido = response.choices[0].message.content
     if contenido is None:
         raise RuntimeError(
-            "El modelo no devolvió contenido visible. "
-            "Probablemente agotó los tokens en razonamiento interno. "
-            f"Tokens de razonamiento usados: ~{len(razonamiento) if razonamiento else 'N/D'}"
+            "El modelo no devolvió contenido visible en ningun intento. "
+            "Reduce los datos del prompt o aumenta MAX_TOKENS."
         )
+
+    if finish_reason == "length":
+        print(f"\n  [ADVERTENCIA] Respuesta truncada (finish_reason='length'). "
+              f"Considera aumentar MAX_TOKENS (actual: {MAX_TOKENS})")
 
     if razonamiento:
         print(f"\n  [DeepSeek razonó {len(razonamiento)} chars internamente]")

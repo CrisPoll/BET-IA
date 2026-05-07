@@ -202,16 +202,23 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
     except Exception:
         pass
 
-    # 5.5. WhoScored arbitro (manual - el usuario pega la URL)
+    # 5.5. Arbitro (WhoScored o Transfermarkt - el usuario pega la URL)
     try:
-        print(f"     Pega la URL de WhoScored del arbitro (Enter para omitir):")
-        url_ws = input("     > ").strip()
-        if url_ws:
-            from whoscored_client import enriquecer_arbitro_whoscored
-            datos_resumidos = enriquecer_arbitro_whoscored(datos_resumidos, url_ws)
-            ws = (datos_resumidos.get("arbitro") or {}).get("_whoscored", {})
-            if ws:
-                print(f"     \u2713 WhoScored: {ws.get('yc_pp', '?')} YC/part, {ws.get('total_partidos', '?')} partidos")
+        print(f"     Pega URL del arbitro en WhoScored o Transfermarkt (Enter para omitir):")
+        url_arb = input("     > ").strip()
+        if url_arb:
+            if "whoscored.com" in url_arb:
+                from whoscored_client import enriquecer_arbitro_whoscored
+                datos_resumidos = enriquecer_arbitro_whoscored(datos_resumidos, url_arb)
+                ws = (datos_resumidos.get("arbitro") or {}).get("_whoscored", {})
+                if ws:
+                    print(f"     \u2713 WhoScored: {ws.get('yc_pp', '?')} YC/part, {ws.get('total_partidos', '?')} partidos")
+            elif "transfermarkt" in url_arb:
+                from transfermarkt_client import enriquecer_arbitro_transfermarkt
+                datos_resumidos = enriquecer_arbitro_transfermarkt(datos_resumidos, url_arb)
+                tm = (datos_resumidos.get("arbitro") or {}).get("_transfermarkt", {})
+                if tm:
+                    print(f"     \u2713 Transfermarkt: {tm.get('yc_pp', '?')} YC/part, {tm.get('total_partidos', '?')} partidos")
     except Exception:
         pass
 

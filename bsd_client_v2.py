@@ -42,7 +42,7 @@ TOP_LEAGUES = {
     "Copa Libertadores": 32,
     "Copa Sudamericana": 33,
 }
-TARGET_LEAGUE_IDS = [9, 3, 5, 1, 7, 32, 33]
+TARGET_LEAGUE_IDS = [9, 3, 5, 1, 7, 8, 32, 33]
 LEAGUE_NAMES = {v: k for k, v in TOP_LEAGUES.items()}
 
 

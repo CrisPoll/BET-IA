@@ -171,20 +171,29 @@ def _cargar_datos_partido(partido: dict):
     except Exception:
         pass
 
-    # WhoScored arbitro
+    # Arbitro (WhoScored o Transfermarkt)
     try:
-        from whoscored_client import enriquecer_arbitro_whoscored
-        print("  Pegá la URL de WhoScored del árbitro (Enter para omitir):")
-        url_ws = input("  > ").strip()
-        if url_ws:
-            datos_resumidos = enriquecer_arbitro_whoscored(datos_resumidos, url_ws)
-            ws = (datos_resumidos.get("arbitro") or {}).get("_whoscored", {})
-            if ws:
-                print(f"  [OK] WhoScored arbitro: {ws.get('yc_pp', '?')} YC/part, {ws.get('total_partidos', '?')} partidos")
-            else:
-                print("  [WARN] WhoScored no devolvio datos")
+        print("  Pega URL del arbitro en WhoScored o Transfermarkt (Enter para omitir):")
+        url_arb = input("  > ").strip()
+        if url_arb:
+            if "whoscored.com" in url_arb:
+                from whoscored_client import enriquecer_arbitro_whoscored
+                datos_resumidos = enriquecer_arbitro_whoscored(datos_resumidos, url_arb)
+                ws = (datos_resumidos.get("arbitro") or {}).get("_whoscored", {})
+                if ws:
+                    print(f"  [OK] WhoScored: {ws.get('yc_pp', '?')} YC/part, {ws.get('total_partidos', '?')} partidos")
+                else:
+                    print("  [WARN] WhoScored no devolvio datos")
+            elif "transfermarkt" in url_arb:
+                from transfermarkt_client import enriquecer_arbitro_transfermarkt
+                datos_resumidos = enriquecer_arbitro_transfermarkt(datos_resumidos, url_arb)
+                tm = (datos_resumidos.get("arbitro") or {}).get("_transfermarkt", {})
+                if tm:
+                    print(f"  [OK] Transfermarkt: {tm.get('yc_pp', '?')} YC/part, {tm.get('total_partidos', '?')} partidos")
+                else:
+                    print("  [WARN] Transfermarkt no devolvio datos")
     except Exception as e:
-        print(f"  [WARN] WhoScored: {e}")
+        print(f"  [WARN] Arbitro: {e}")
 
     return datos_resumidos, prediccion_resumida
 

@@ -34,7 +34,7 @@ TOP_LEAGUES = {
 }
 
 # IDs de las ligas y torneos objetivo para el análisis
-TARGET_LEAGUE_IDS = [9, 3, 5, 1, 7, 32, 33]  # Brasileirao, La Liga, Bundesliga, Premier, UCL, Libertadores, Sudamericana
+TARGET_LEAGUE_IDS = [9, 3, 5, 1, 7, 8, 32, 33]  # Brasileirao, La Liga, Bundesliga, Premier, UCL, UEL, Libertadores, Sudamericana
 
 # Mapeo de ID de liga a nombre
 LEAGUE_NAMES = {v: k for k, v in TOP_LEAGUES.items()}

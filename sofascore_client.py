@@ -360,6 +360,8 @@ def _extraer_performance(data: dict, team_id: int) -> dict:
             "local": team_home,
             "gf": gf,
             "gc": gc,
+            "event_id": ev.get("id"),
+            "torneo": (ev.get("tournament") or {}).get("name", ""),
         })
 
     n = len(events)
@@ -374,6 +376,68 @@ def _extraer_performance(data: dict, team_id: int) -> dict:
         "ppg": round(puntos / n, 2),
         "detalle": detalle,
     }
+
+
+def _extraer_stats_minimas(stats_data: dict, team_id: int) -> dict | None:
+    """Extrae solo las stats clave del periodo ALL para un equipo."""
+    stats_list = stats_data.get("statistics", [])
+    for period_stats in stats_list:
+        if period_stats.get("period") != "ALL":
+            continue
+        result = {}
+        for group in period_stats.get("groups", []):
+            for item in group.get("statisticsItems", []):
+                key = item.get("key", "")
+                home_val = item.get("home", 0) or 0
+                away_val = item.get("away", 0) or 0
+                team_home = item.get("homeTeamId") == team_id if "homeTeamId" in item else None
+                # Store both values
+                if key in ("totalShotsOnGoal", "totalShots"):
+                    result["tiros_total"] = {"home": home_val, "away": away_val}
+                elif key == "shotsOnGoal":
+                    result["tiros_arco"] = {"home": home_val, "away": away_val}
+                elif key == "cornerKicks":
+                    result["corners"] = {"home": home_val, "away": away_val}
+                elif key == "yellowCards":
+                    result["amarillas"] = {"home": home_val, "away": away_val}
+                elif key == "redCards":
+                    result["rojas"] = {"home": home_val, "away": away_val}
+                elif key == "fouls":
+                    result["faltas"] = {"home": home_val, "away": away_val}
+        return result if result else None
+    return None
+
+
+def _fetch_performance_stats(session, perf_data: list, team_id: int, max_eventos: int = 5) -> list:
+    """Obtiene stats minimas para los ultimos N eventos de performance."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    eventos = perf_data[:max_eventos]
+    resultados = [None] * len(eventos)
+
+    def _fetch(idx, eid):
+        try:
+            r = session.get(
+                f"{SOFASCORE_API}/event/{eid}/statistics",
+                impersonate="chrome131",
+                timeout=15,
+            )
+            return (idx, _extraer_stats_minimas(r.json(), team_id))
+        except Exception:
+            return (idx, None)
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {
+            pool.submit(_fetch, i, ev.get("event_id")): i
+            for i, ev in enumerate(eventos)
+            if ev.get("event_id")
+        }
+        for future in as_completed(futures):
+            idx, stats = future.result()
+            if stats:
+                resultados[idx] = stats
+
+    return resultados
 
 
 # ── Nuevas funciones de extraccion para endpoints avanzados ──
@@ -981,6 +1045,18 @@ def enriquecer_datos_partido(datos_bsd: dict) -> dict:
                 enriquecido["_lineups_raw"], shotmap_list, event_id
             )
 
+        # Obtener stats por partido para los eventos de performance
+        for pkey, tid in [("form_performance_local", home_team_id), ("form_performance_visitante", away_team_id)]:
+            perf = enriquecido.get(pkey, {})
+            detalle = perf.get("detalle", [])
+            if detalle and tid:
+                try:
+                    stats_per_match = _fetch_performance_stats(session, detalle, tid, max_eventos=10)
+                    if any(s is not None for s in stats_per_match):
+                        enriquecido[f"{pkey}_stats_per_match"] = stats_per_match
+                except Exception:
+                    pass
+
     datos_bsd["_sofascore"] = enriquecido
     return datos_bsd
 
@@ -998,6 +1074,8 @@ def _formatear_form_performance_para_prompt(datos: dict) -> str:
     away_team = datos.get("partido", "").split(" vs ")[1] if " vs " in datos.get("partido", "") else "Visitante"
 
     partes = ["\n### FORMA RECIENTE (SofaScore Performance)"]
+    # Detectar el torneo actual del partido que se analiza
+    torneo_actual = sofas.get("torneo", "")
     for equipo, key in [(local_team, "form_performance_local"), (away_team, "form_performance_visitante")]:
         perf = sofas.get(key, {})
         if not perf:
@@ -1009,12 +1087,58 @@ def _formatear_form_performance_para_prompt(datos: dict) -> str:
             f"Prom GF: {perf.get('promedio_goles_favor', '?')} | Prom GC: {perf.get('promedio_goles_contra', '?')}"
         )
         detalle = perf.get("detalle", [])
+        stats_list = sofas.get(f"{key}_stats_per_match", [])
         if detalle:
-            partes.append("  Desglose por partido (del mas reciente al mas antiguo):")
-            for i, m in enumerate(detalle[:5]):
-                loc = "CASA" if m.get("local") else "FUERA"
-                partes.append(f"    {i+1}. vs {m.get('rival', '?')} ({loc}): {m.get('gf', 0)}-{m.get('gc', 0)}")
-            partes.append("  NOTA: Evaluar si los resultados fueron consistentes o si hubo outliers (ej: goleada unica que infla el promedio).")
+            # Agrupar por torneo
+            torneos = {}
+            for m in detalle[:10]:
+                tn = m.get("torneo", "Otros")
+                torneos.setdefault(tn, []).append(m)
+
+            # Orden: primero el torneo actual, despues los demas
+            orden = []
+            if torneo_actual and torneo_actual in torneos:
+                orden.append(torneo_actual)
+            for tn in torneos:
+                if tn != torneo_actual:
+                    orden.append(tn)
+
+            for tn in orden[:2]:
+                matches = torneos[tn]
+                es_copa = any(w in tn.lower() for w in ["copa", "libertadores", "champions", "sudamericana", "concacaf", "europa", "uefa"])
+                label = "Copa/Torneo" if es_copa else "Liga"
+                # Para copa/torneo: mostrar TODOS los partidos de esta temporada
+                # Para liga: solo ultimos 5
+                if not es_copa:
+                    matches = matches[:5]
+                partes.append(f"  Ultimos en {label} ({tn}):")
+                for m in matches:
+                    idx = next((i for i, d in enumerate(detalle) if d.get("event_id") == m.get("event_id")), -1)
+                    loc = "CASA" if m.get("local") else "FUERA"
+                    linea = f"    vs {m.get('rival', '?')} ({loc}): {m.get('gf', 0)}-{m.get('gc', 0)}"
+                    st = stats_list[idx] if 0 <= idx < len(stats_list) and stats_list[idx] else None
+                    if st:
+                        th = st.get("tiros_total", {}).get("home", 0)
+                        ta = st.get("tiros_total", {}).get("away", 0)
+                        ah = st.get("tiros_arco", {}).get("home", 0)
+                        aa = st.get("tiros_arco", {}).get("away", 0)
+                        yh = st.get("amarillas", {}).get("home", 0)
+                        ya = st.get("amarillas", {}).get("away", 0)
+                        ch = st.get("corners", {}).get("home", 0)
+                        ca = st.get("corners", {}).get("away", 0)
+                        extras = []
+                        if th or ta:
+                            extras.append(f"Tiros: {th}-{ta}")
+                        if ah or aa:
+                            extras.append(f"Arco: {ah}-{aa}")
+                        if yh or ya:
+                            extras.append(f"YC: {yh}-{ya}")
+                        if ch or ca:
+                            extras.append(f"Corners: {ch}-{ca}")
+                        if extras:
+                            linea += " | " + " | ".join(extras)
+                    partes.append(linea)
+            partes.append("  NOTA: Evaluar si los resultados fueron consistentes o si hubo outliers.")
     return "\n".join(partes)
 
 

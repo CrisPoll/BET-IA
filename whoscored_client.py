@@ -98,11 +98,14 @@ async def _scrapear_async(url: str) -> dict | None:
     if not text:
         return None
 
-    # Extraer nombre del arbitro
-    nombre_match = re.search(r"Jo[ãa]o\s+(\w+)|(\w[\w\s]+?)\n(?:Campeonatos|PARTIDOS)", text)
+    # Extraer nombre del arbitro del title de la pagina
+    nombre_match = re.search(r"<title>([^<]+)</title>", text)
     nombre = ""
-    if nombre_match:
-        nombre = nombre_match.group(0).split("\n")[0].strip()
+    if not nombre:
+        # Fallback: buscar texto grande antes de "Campeonatos" o "PARTIDOS"
+        nombre_match = re.search(r"(\w[\w\s\.]{3,30}?)\n(?:Campeonatos|PARTIDOS)", text)
+        if nombre_match:
+            nombre = nombre_match.group(1).strip()
 
     stats = _extraer_stats(text)
     if not stats or not stats.get("total_partidos"):
