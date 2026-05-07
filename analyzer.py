@@ -28,8 +28,6 @@ from flashscore_client import (
     _formatear_standings_flashscore_para_prompt,
 )
 from betsafe_client import _formatear_cuotas_betsafe_para_prompt
-from whoscored_client import formatear_arbitro_whoscored_para_prompt
-from transfermarkt_client import formatear_arbitro_transfermarkt_para_prompt
 from bsd_client_v2 import (
     resumir_stats_v2_para_prompt,
     resumir_metadata_v2_para_prompt,
@@ -66,7 +64,7 @@ REGLAS DE PONDERACION OBLIGATORIAS:
 - Los partidos de H2H de mas de 3 anios atras son irrelevantes (plantillas y estilos cambiaron).
 - Si el H2H proviene de Champions League pero los equipos nunca se enfrentaron con estas plantillas, dale peso BAJO.
 - LESIONES/SUSPENSIONES (BSD): Los datos de bajas vienen de BSD. Usalos como REFERENCIA pero con PRECAUCION: BSD no siempre es preciso. Si un jugador aparece como lesionado en BSD pero SofaScore lo pone titular, SofaScore MANDA -> el jugador JUEGA.
-- ARBITRO: Los datos del arbitro se obtienen de WhoScored/Transfermarkt (si el usuario los proporciona), o de BSD v2 como fallback automatico. La seccion DATOS ADICIONALES muestra la fuente mas completa disponible. Usa el promedio de la competicion del partido actual, no el total de carrera.
+- ARBITRO: Los datos del arbitro se muestran en la seccion ARBITRO al inicio del prompt. Vienen de la mejor fuente disponible (SofaScore > WhoScored > Transfermarkt > BSD v2). Usa el promedio de la competicion del partido actual, no el total de carrera. Si el arbitro no esta asignado, omite el factor arbitral.
 
 REGLAS DE REMATES (TIROS):
 - La fuente principal son los datos por partido en FORMA RECIENTE (tiros totales, al arco, corners) y los promedios de BSD (remates_promedio, remates_arco_promedio).
@@ -82,12 +80,11 @@ REGLAS DE MOMENTUM:
 - El momentum mide dominio acumulado minuto a minuto (no solo posesion, sino presion ofensiva).
 
 REGLAS DE TARJETAS Y ARBITRO:
-- La fuente PRINCIPAL para datos de arbitro es WhoScored/Transfermarkt (si estan disponibles): desglose por competicion, YC/partido, RC/partido, faltas/partido.
-- Si no hay WhoScored/Transfermarkt, usa BSD v2 (avg_yellow_per_match, avg_fouls_per_match) como referencia.
-- SI HAY DATOS FLASHSCORE del arbitro, cruzalos con los datos de WhoScored/ValueStats.
-- IMPORTANTE: Si WhoScored muestra YC/partido distintos en liga local vs Champions League, usa el promedio de la competicion del partido actual, no el total.
-- Derbis y partidos de alta rivalidad -> mas tarjetas esperadas.
-- Si el arbitro NO esta asignado aun, NO inventes sustitutos.
+- La fuente PRINCIPAL para datos de arbitro es SofaScore (si el usuario proporciona la URL): datos completos de carrera con desglose por torneo, YC/part, RC/part, totales.
+- Si no hay SofaScore, usa WhoScored/Transfermarkt como alternativa.
+- Si ninguno esta disponible, usa BSD v2 (avg_yellow_per_match, avg_fouls_per_match) como referencia.
+- SI HAY DATOS FLASHSCORE del arbitro, cruzalos con los datos de SofaScore/WhoScored.
+- IMPORTANTE: El arbitro tiene medias de tarjetas DISTINTAS segun la competicion. Usa SIEMPRE el promedio de la competicion del partido actual, no el total de carrera. Si el partido es de Libertadores, usa el promedio de Libertadores de ESE arbitro.
 
 REGLAS DE ALINEACIONES / DISPONIBILIDAD DE JUGADORES:
 - LA ALINEACION DE SOFASCORE ES LA FUENTE UNICA Y DEFINITIVA de que jugadores juegan.
@@ -133,7 +130,7 @@ Estimacion de tiros totales y al arco (promedio esperado para el partido).
 Justificacion: basada en los datos por partido de la seccion FORMA RECIENTE y cuotas de Betsafe.
 
 [TARJETAS]
-Amarillas esperadas (rango bajo/medio/alto). Menciona al arbitro si esta asignado.
+Amarillas esperadas (rango bajo/medio/alto). Menciona al arbitro y su media en ESTA competicion especifica.
 
 [CORNERS]
 Estimacion de corners totales basada en datos por partido (FORMA RECIENTE) y cuotas de Betsafe.
@@ -147,6 +144,60 @@ Mejor apuesta con valor (1-2 lineas). Si no hay valor, dilo.
 Si hay contexto favorable para tiros/amarillas/corners, menciona como nota adicional.
 Si el mercado de Betsafe marca Over con cuota muy baja (<1.35), alineate con el mercado salvo evidencia abrumadora en contra."""
 
+
+
+def _formatear_arbitro_header(datos: dict) -> str:
+    """Arbitro inline en el header del prompt, usando la mejor fuente disponible."""
+    arb = datos.get("arbitro")
+    if not arb:
+        return "ARBITRO NO ASIGNADO. No asumas nada sobre su estilo; omite el factor arbitral."
+
+    nombre = arb.get("nombre", "Desconocido")
+    pais = arb.get("nacionalidad", arb.get("pais", ""))
+    header = f"Nombre: {nombre}"
+    if pais:
+        header += f" ({pais})"
+
+    # Buscar la mejor fuente: SofaScore > WhoScored > Transfermarkt > BSD v2
+    sf = arb.get("_sofascore_ref", {})
+    ws = arb.get("_whoscored", {})
+    tm = arb.get("_transfermarkt", {})
+
+    ref_data = sf or ws or tm
+    if ref_data:
+        partes = [header]
+        if ref_data.get("total_partidos"):
+            partes.append(f"- Partidos dirigidos: {ref_data['total_partidos']}")
+        if ref_data.get("yc_pp") is not None:
+            partes.append(f"- Amarillas/partido: {ref_data['yc_pp']}")
+        if ref_data.get("rc_pp") is not None:
+            partes.append(f"- Rojas/partido: {ref_data['rc_pp']}")
+        if ref_data.get("faltas_pp") is not None:
+            partes.append(f"- Faltas/partido: {ref_data['faltas_pp']}")
+
+        # Torneos con promedios (solo los mas relevantes)
+        torneos = ref_data.get("torneos", ref_data.get("competiciones", []))
+        if torneos:
+            partes.append("- Promedios por competicion:")
+            for t in torneos[:8]:
+                tn = t.get("nombre", "?")
+                yc = t.get("yc_pp", "?")
+                rc = t.get("rc_pp", "?")
+                partes.append(f"    {tn}: {yc} YC/part, {rc} RC/part")
+        return "\n".join(partes)
+
+    # Fallback: BSD v2
+    yc = arb.get("avg_yellow_per_match")
+    faltas = arb.get("avg_fouls_per_match")
+    if yc is not None or faltas is not None:
+        partes = [header]
+        if yc is not None:
+            partes.append(f"- Amarillas/partido: {yc}")
+        if faltas is not None:
+            partes.append(f"- Faltas/partido: {faltas}")
+        return "\n".join(partes)
+
+    return header
 
 
 def _formatear_forma_bsd_compact(datos: dict) -> str:
@@ -183,10 +234,7 @@ Fecha: {datos_resumidos.get('fecha', 'Desconocida')}
 {f"Estadio: {datos_resumidos.get('estadio', {}).get('nombre', '?')} ({datos_resumidos.get('estadio', {}).get('ciudad', '?')}, cap: {datos_resumidos.get('estadio', {}).get('capacidad', '?')})" if datos_resumidos.get('estadio') else ""}
 
 ### ÁRBITRO
-{f"Nombre: {datos_resumidos['arbitro'].get('nombre', 'Desconocido')} ({datos_resumidos['arbitro'].get('nacionalidad', '?')})" if datos_resumidos.get('arbitro') else "ARBITRO NO ASIGNADO. No asumas nada sobre su estilo; simplemente omite el factor arbitral."}
-{f"\n- Amarillas/partido: {datos_resumidos['arbitro'].get('avg_yellow_per_match', '?')}" if datos_resumidos.get('arbitro') and datos_resumidos['arbitro'].get('avg_yellow_per_match') is not None else ""}
-{f"\n- Faltas/partido: {datos_resumidos['arbitro'].get('avg_fouls_per_match', '?')}" if datos_resumidos.get('arbitro') and datos_resumidos['arbitro'].get('avg_fouls_per_match') is not None else ""}
-{f"\n- Goles/partido: {datos_resumidos['arbitro'].get('avg_goals_per_match', '?')}" if datos_resumidos.get('arbitro') and datos_resumidos['arbitro'].get('avg_goals_per_match') is not None else ""}
+{_formatear_arbitro_header(datos_resumidos)}
 
 ### CUOTAS DEL BOOKMAKER
 {_formatear_cuotas_betsafe_para_prompt(datos_resumidos.get('_cuotas', {})) if datos_resumidos.get('_cuotas') else f'''- Local: {datos_resumidos['cuotas'].get('local', 'N/D')}
@@ -313,12 +361,6 @@ def _v2_sections(datos_resumidos: dict) -> str:
 
     # Stats v2
     partes.append(resumir_stats_v2_para_prompt(v2))
-
-    # WhoScored arbitro
-    partes.append(formatear_arbitro_whoscored_para_prompt(datos_resumidos))
-
-    # Transfermarkt arbitro
-    partes.append(formatear_arbitro_transfermarkt_para_prompt(datos_resumidos))
 
     # Player stats v2
     partes.append(resumir_player_stats_v2_para_prompt(v2))

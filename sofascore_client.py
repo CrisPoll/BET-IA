@@ -1977,6 +1977,134 @@ def _imprimir_resultado_salud(resultado: dict):
         print("  ADVERTENCIA: Algunos endpoints de SofaScore fallaron. Los datos pueden estar incompletos.")
 
 
+# ── Datos de arbitro via API de SofaScore ──
+
+def _extraer_id_arbitro_desde_url(url: str) -> int | None:
+    """Extrae el ID del arbitro desde una URL de SofaScore.
+    Ej: https://www.sofascore.com/football/referee/herrera-alexis/786550 -> 786550"""
+    m = re.search(r"/referee/[^/]+/(\d+)", url)
+    return int(m.group(1)) if m else None
+
+
+def obtener_datos_arbitro_sofascore(session, arb_id: int) -> dict | None:
+    """Obtiene estadisticas del arbitro desde la API de SofaScore."""
+    try:
+        r = session.get(
+            f"{SOFASCORE_API}/referee/{arb_id}",
+            timeout=15,
+        )
+        profile = r.json().get("referee", {})
+    except Exception:
+        return None
+
+    if not profile:
+        return None
+
+    result = {
+        "nombre": profile.get("name", ""),
+        "pais": (profile.get("country") or {}).get("name", ""),
+        "total_partidos": profile.get("games"),
+        "yc_total": profile.get("yellowCards"),
+        "rc_total": profile.get("redCards"),
+        "ycrc_total": profile.get("yellowRedCards"),
+    }
+
+    # Calcular promedios
+    games = result["total_partidos"] or 1
+    if result["yc_total"] is not None:
+        result["yc_pp"] = round(result["yc_total"] / games, 2)
+    if result["rc_total"] is not None:
+        result["rc_pp"] = round(result["rc_total"] / games, 2)
+
+    # Obtener desglose por torneo
+    try:
+        r2 = session.get(
+            f"{SOFASCORE_API}/referee/{arb_id}/statistics",
+            timeout=15,
+        )
+        stats = r2.json().get("statistics", [])
+    except Exception:
+        stats = []
+
+    torneos = []
+    for s in stats:
+        t = s.get("uniqueTournament", {})
+        apps = s.get("appearances", 0)
+        yc = s.get("yellowCards", 0)
+        rc = s.get("redCards", 0)
+        ycrc = s.get("yellowRedCards", 0)
+        pen = s.get("penalty", 0)
+        if apps > 0:
+            torneos.append({
+                "nombre": t.get("name", "?"),
+                "partidos": apps,
+                "yc_total": yc,
+                "yc_pp": round(yc / apps, 2),
+                "rc_total": rc + ycrc,
+                "rc_pp": round((rc + ycrc) / apps, 2),
+                "penaltis": pen,
+            })
+    if torneos:
+        result["torneos"] = torneos
+
+    return result
+
+
+def enriquecer_arbitro_sofascore(datos_resumidos: dict, url: str) -> dict:
+    """Enriquece datos del arbitro desde URL de SofaScore."""
+    arb_id = _extraer_id_arbitro_desde_url(url)
+    if not arb_id:
+        return datos_resumidos
+
+    try:
+        session = _crear_sesion_sofascore()
+        sf_data = obtener_datos_arbitro_sofascore(session, arb_id)
+        if sf_data:
+            merged = {**(datos_resumidos.get("arbitro") or {}), "_sofascore_ref": sf_data}
+            datos_resumidos["arbitro"] = merged
+    except Exception:
+        pass
+
+    return datos_resumidos
+
+
+def formatear_arbitro_sofascore_para_prompt(datos_resumidos: dict) -> str:
+    """Formatea datos del arbitro de SofaScore para el prompt."""
+    arb = datos_resumidos.get("arbitro", {})
+    sf = arb.get("_sofascore_ref", {})
+    if not sf:
+        return ""
+
+    partes = [f"\n### ARBITRO (SofaScore): {sf.get('nombre', arb.get('nombre', '?'))}"]
+
+    if sf.get("pais"):
+        partes[0] += f" ({sf['pais']})"
+
+    if sf.get("total_partidos"):
+        partes.append(f"- Partidos dirigidos: {sf['total_partidos']}")
+
+    yc = sf.get("yc_pp")
+    if yc is not None:
+        partes.append(f"- Amarillas/partido: {yc} (total: {sf.get('yc_total', '?')})")
+
+    rc = sf.get("rc_pp")
+    if rc is not None:
+        partes.append(f"- Rojas/partido: {rc} (total: {sf.get('rc_total', '?')} incl. doble amarilla: {sf.get('ycrc_total', 0)})")
+
+    torneos = sf.get("torneos", [])
+    if torneos:
+        partes.append(f"\n  Por torneo ({len(torneos)} competiciones):")
+        for t in torneos:
+            partes.append(
+                f"    {t['nombre']}: {t.get('partidos', '?')} part, "
+                f"{t.get('yc_pp', '?')} YC/part ({t.get('yc_total', 0)} total), "
+                f"{t.get('rc_pp', '?')} RC/part ({t.get('rc_total', 0)} total)"
+            )
+
+    partes.append("(Fuente: SofaScore API - datos completos de carrera)")
+    return "\n".join(partes)
+
+
 def obtener_partidos_sofascore_only() -> list:
     """
     Obtiene proximos partidos de ligas que solo estan en SofaScore (sin BSD).

@@ -269,7 +269,7 @@ class BettingCog(commands.Cog):
                 except Exception:
                     pass
 
-            # Arbitro WhoScored / Transfermarkt
+            # Arbitro WhoScored / Transfermarkt / SofaScore
             if arbitro_url:
                 await _update("Scrapeando datos del arbitro...")
                 try:
@@ -279,6 +279,9 @@ class BettingCog(commands.Cog):
                     elif "transfermarkt" in arbitro_url:
                         from transfermarkt_client import enriquecer_arbitro_transfermarkt
                         datos_resumidos = await asyncio.to_thread(enriquecer_arbitro_transfermarkt, datos_resumidos, arbitro_url)
+                    elif "sofascore.com" in arbitro_url:
+                        from sofascore_client import enriquecer_arbitro_sofascore
+                        datos_resumidos = enriquecer_arbitro_sofascore(datos_resumidos, arbitro_url)
                 except Exception:
                     pass
 

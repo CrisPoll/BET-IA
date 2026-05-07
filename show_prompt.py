@@ -171,9 +171,9 @@ def _cargar_datos_partido(partido: dict):
     except Exception:
         pass
 
-    # Arbitro (WhoScored o Transfermarkt)
+    # Arbitro (WhoScored / Transfermarkt / SofaScore)
     try:
-        print("  Pega URL del arbitro en WhoScored o Transfermarkt (Enter para omitir):")
+        print("  Pega URL del arbitro (WhoScored/Transfermarkt/SofaScore) o Enter para omitir:")
         url_arb = input("  > ").strip()
         if url_arb:
             if "whoscored.com" in url_arb:
@@ -192,6 +192,14 @@ def _cargar_datos_partido(partido: dict):
                     print(f"  [OK] Transfermarkt: {tm.get('yc_pp', '?')} YC/part, {tm.get('total_partidos', '?')} partidos")
                 else:
                     print("  [WARN] Transfermarkt no devolvio datos")
+            elif "sofascore.com" in url_arb:
+                from sofascore_client import enriquecer_arbitro_sofascore
+                datos_resumidos = enriquecer_arbitro_sofascore(datos_resumidos, url_arb)
+                sf = (datos_resumidos.get("arbitro") or {}).get("_sofascore_ref", {})
+                if sf:
+                    print(f"  [OK] SofaScore: {sf.get('yc_pp', '?')} YC/part, {sf.get('total_partidos', '?')} partidos")
+                else:
+                    print("  [WARN] SofaScore no devolvio datos")
     except Exception as e:
         print(f"  [WARN] Arbitro: {e}")
 
