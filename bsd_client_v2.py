@@ -170,9 +170,18 @@ def obtener_manager(manager_id: int) -> dict:
 # REFEREES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def obtener_arbitro(referee_id: int) -> dict:
-    """Estadisticas completas del arbitro (YC/RC/fouls/goals por partido)."""
-    return _get(f"referees/{referee_id}/")
+def obtener_arbitro(referee_id: int = None, league_id: int = None, referee_name: str = None) -> dict:
+    """Estadisticas del arbitro. Si se provee league_id+name, filtra por liga."""
+    if league_id and referee_name:
+        params = {"league_id": league_id, "name": referee_name, "limit": 5}
+        data = _get("referees/", params=params)
+        results = data.get("results", [])
+        if results:
+            return results[0]
+        return {"_error": "No se encontro al arbitro en esa liga"}
+    if referee_id:
+        return _get(f"referees/{referee_id}/")
+    return {"_error": "Faltan parametros"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -309,7 +318,8 @@ def enriquecer_con_v2(datos_resumidos: dict, match_id: int) -> dict:
         if away_coach_id:
             futures["manager_away"] = pool.submit(_safe, obtener_manager, away_coach_id)
         if referee_id:
-            futures["referee"] = pool.submit(_safe, obtener_arbitro, referee_id)
+            arb_name = (datos_resumidos.get("arbitro") or {}).get("nombre", "")
+            futures["referee"] = pool.submit(_safe, obtener_arbitro, referee_id, league_id, arb_name)
         if league_id:
             futures["standings"] = pool.submit(_safe, obtener_standings, league_id)
         if home_id:
@@ -503,7 +513,7 @@ def resumir_standings_v2_para_prompt(v2_data: dict, home_id: int = None, away_id
     if not standings or "_error" in standings:
         return ""
 
-    rows = standings.get("results", [])
+    rows = standings.get("standings", [])
     if not rows:
         return ""
 

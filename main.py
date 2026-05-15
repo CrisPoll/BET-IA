@@ -25,7 +25,6 @@ from betsafe_client import obtener_cuotas_betsafe_desde_url
 from analyzer import analizar_partido
 import prediction_db as db
 from quant_model import run_full_projection
-from bankroll import get_stats_summary as get_bankroll_summary
 
 logging.basicConfig(level=logging.INFO, format="  [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -272,10 +271,8 @@ def main():
         print("  1. Ver próximos partidos")
         print("  2. Seleccionar partido y analizar")
         if partidos_cache:
-            print(f"  3. Actualizar lista de partidos ({len(partidos_cache)} en caché)")
-        else:
-            print("  3. Salir")
-        print("  4. Ver performance del sistema (MAE / ROI / Calibración)")
+            print(f"  3. Actualizar lista de partidos ({len(partidos_cache)} en cache)")
+        print("  4. Ver performance del sistema (MAE / ROI / Calibracion)")
         print("  5. Ver predicciones recientes")
         print("  0. Salir")
 
@@ -347,8 +344,7 @@ def main():
                 except Exception as e:
                     print(f"\n  ✗ Error al actualizar: {e}")
             else:
-                print("\n  ¡Hasta luego!")
-                sys.exit(0)
+                print("\n  Primero carga los partidos con la opcion 1.")
 
         elif opcion == "4":
             _menu_performance()

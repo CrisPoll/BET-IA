@@ -542,13 +542,14 @@ def analizar_partido(datos_resumidos: dict, prediccion_resumida: dict) -> str:
         contenido, razonamiento, finish_reason = _call_deepseek(client, prompt_usuario, include_reasoning=False)
     if contenido is None:
         raise RuntimeError("El modelo no devolvió contenido visible.")
-        if finish_reason == "length":
-            print(f"  [ADVERTENCIA] Respuesta truncada. Considera aumentar MAX_TOKENS.")
-        if razonamiento:
-            print(f"  [DeepSeek] Razonó {len(razonamiento)} chars internamente")
 
-        analysis_text = contenido
-        llm_projections = _extract_llm_projections(analysis_text)
+    if finish_reason == "length":
+        print(f"  [ADVERTENCIA] Respuesta truncada. Considera aumentar MAX_TOKENS.")
+    if razonamiento:
+        print(f"  [DeepSeek] Razonó {len(razonamiento)} chars internamente")
+
+    analysis_text = contenido
+    llm_projections = _extract_llm_projections(analysis_text)
 
     # 4. Evaluar Kelly stakes y agregar al output
     kelly_section = _build_kelly_section(datos_resumidos, quant_projections)

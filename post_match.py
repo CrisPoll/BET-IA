@@ -10,7 +10,7 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 
 import prediction_db as db
-from bankroll import update_bet_result
+from prediction_db import update_bet_result
 
 
 def _separador():
