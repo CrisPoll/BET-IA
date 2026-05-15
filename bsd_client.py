@@ -21,12 +21,12 @@ BSD_API_KEY = os.getenv("BSD_API_KEY")
 
 # IDs de ligas y torneos según BSD
 TOP_LEAGUES = {
-    # Ligas objetivo
-    "Brasileirão Serie A": 9,
+    "Brasileirao Serie A": 9,
     "Premier League": 1,
     "La Liga": 3,
     "Bundesliga": 5,
-    # Torneos internacionales
+    "Serie A": 4,
+    "Ligue 1": 6,
     "Champions League": 7,
     "Europa League": 8,
     "Copa Libertadores": 32,
@@ -34,7 +34,7 @@ TOP_LEAGUES = {
 }
 
 # IDs de las ligas y torneos objetivo para el análisis
-TARGET_LEAGUE_IDS = [9, 3, 5, 1, 7, 8, 32, 33]  # Brasileirao, La Liga, Bundesliga, Premier, UCL, UEL, Libertadores, Sudamericana
+TARGET_LEAGUE_IDS = [9, 3, 5, 4, 6, 1, 7, 8, 32, 33]
 
 # Mapeo de ID de liga a nombre
 LEAGUE_NAMES = {v: k for k, v in TOP_LEAGUES.items()}

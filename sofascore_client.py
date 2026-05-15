@@ -57,8 +57,7 @@ SOFASCORE_TOURNAMENT_IDS = {
 }
 
 # Ligas que SOLO estan en SofaScore (BSD no las cubre)
-SOFASCORE_ONLY_LEAGUES = {
-    "Liga 1 Peru": 34467,  # Liga 1, Apertura 2026
+SOFASCORE_ONLY_LEAGUES: dict[str, int] = {
 }
 
 # Mapeo para standings: BSD league name → (unique_tournament_id, season_id)
@@ -66,7 +65,9 @@ STANDINGS_MAP = {
     "La Liga":                (8,   77559),
     "Premier League":         (17,  76986),
     "Bundesliga":             (35,  77333),
-    "Brasileirão Serie A":    (325, 87678),
+    "Serie A":                (23,  76457),
+    "Ligue 1":                (34,  77356),
+    "Brasileirao Serie A":    (325, 87678),
     "Champions League":       (7,   77817),
     "Europa League":          (679, 78071),
     "Copa Libertadores":      (586, 80738),

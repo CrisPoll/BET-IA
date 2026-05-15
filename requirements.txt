@@ -5,3 +5,4 @@ curl_cffi>=0.6.0
 py-cord>=2.6
 playwright>=1.52.0
 pandas>=2.2.0
+scikit-learn>=1.4.0

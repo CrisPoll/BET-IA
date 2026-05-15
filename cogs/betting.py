@@ -45,7 +45,7 @@ def _parse_urls(args: str) -> tuple:
         w = w.strip()
         if "betsafe" in w:
             betsafe_url = w
-        elif "whoscored" in w or "transfermarkt" in w:
+        elif any(site in w for site in ("whoscored", "transfermarkt", "sofascore")):
             arbitro_url = w
     return betsafe_url, arbitro_url
 
@@ -171,11 +171,31 @@ class BettingCog(commands.Cog):
     async def analizar(self, ctx: commands.Context, match_id: int, *, args: str = ""):
         betsafe_url, arbitro_url = _parse_urls(args) if args else ("", "")
 
+        # Buscar en el cache para saber si es SofaScore-only
+        cached = None
+        for m in self._match_cache:
+            if m.get("id") == match_id:
+                cached = m
+                break
+
+        # Si el cache dice que es SofaScore-only, usar ese flujo directamente
+        if cached and cached.get("_source") == "sofascore_only":
+            async with ctx.typing():
+                await self._analyze_match(ctx, cached, betsafe_url, arbitro_url)
+            return
+
         async with ctx.typing():
             try:
                 detalle = obtener_detalle_partido(match_id)
             except Exception as e:
-                await ctx.send(f"\u274c Error al obtener el partido {match_id}: {e}")
+                # Si BSD falla (404) y no lo encontramos en cache, intentar con SofaScore
+                if cached:
+                    await self._analyze_match(ctx, cached, betsafe_url, arbitro_url)
+                    return
+                await ctx.send(
+                    f"\u274c Error al obtener el partido {match_id}: {e}\n"
+                    f"Si es un partido de una liga no cubierta por BSD, usa `!partidos` primero y volve a intentar."
+                )
                 return
 
             local = detalle.get("home_team", "?")

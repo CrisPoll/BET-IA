@@ -37,12 +37,14 @@ TOP_LEAGUES = {
     "Premier League": 1,
     "La Liga": 3,
     "Bundesliga": 5,
+    "Serie A": 4,
+    "Ligue 1": 6,
     "Champions League": 7,
     "Europa League": 8,
     "Copa Libertadores": 32,
     "Copa Sudamericana": 33,
 }
-TARGET_LEAGUE_IDS = [9, 3, 5, 1, 7, 8, 32, 33]
+TARGET_LEAGUE_IDS = [9, 3, 5, 4, 6, 1, 7, 8, 32, 33]
 LEAGUE_NAMES = {v: k for k, v in TOP_LEAGUES.items()}
 
 

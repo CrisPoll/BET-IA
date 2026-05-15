@@ -1,8 +1,8 @@
 """
-Analizador de Value Betting usando DeepSeek via OpenRouter.
+analyzer.py — Analizador de Mercados Estadísticos usando DeepSeek via OpenRouter.
 
-Toma los datos de un partido (desde BSD + SofaScore) y las predicciones ML,
-los envía a DeepSeek para obtener un análisis experto de value betting.
+VERSIÓN 2.0: Integra modelo cuantitativo + pipeline de agentes + persistencia DB + Kelly stakes.
+Mantiene compatibilidad con llamadas anteriores (analizar_partido).
 """
 
 import os
@@ -36,118 +36,234 @@ from bsd_client_v2 import (
     resumir_squads_v2_para_prompt,
 )
 
+# Nuevos módulos
+from quant_model import run_full_projection
+from agents_pipeline import run_pipeline
+import prediction_db as db
+from bankroll import (
+    evaluate_stat_market,
+    evaluate_1x2,
+    format_recommendations,
+    calibrate_probability,
+    calculate_kelly_stake,
+)
+
 load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 MODEL_NAME = "deepseek/deepseek-v4-pro"
-MAX_TOKENS = 100000  # Holgado: incluye reasoning interno + respuesta visible
-TEMPERATURE = 0.3  # Baja temperatura para análisis más consistente
+MAX_TOKENS = 100000
+TEMPERATURE = 0.3
 
-SYSTEM_PROMPT = """Eres un experto analista de Value Betting en futbol, con mentalidad critica y esceptica ante datos imperfectos.
+# Feature flag: usar pipeline de agentes en lugar de prompt monolítico
+USE_AGENT_PIPELINE = os.getenv("USE_AGENT_PIPELINE", "true").lower() == "true"
 
-PROCESO DE ANALISIS:
-1. Estima probabilidad real (%) de cada outcome para 1X2, BTTS, Over/Under 2.5
-   usando forma reciente, xG, estilos tacticos y contexto ACTUAL de la temporada.
-2. Como CONTEXTO ADICIONAL, analiza tambien:
-   - Tiros totales y tiros al arco (proyecta si el partido sera de muchos/pocos disparos)
-   - Tarjetas amarillas esperadas (considera faltas promedio, estilo arbitral, rivalidad)
-   - Corners esperados (infiere del estilo de juego si no hay datos duros)
-3. Calcula probabilidad implicita: (1 / cuota) * 100
-4. Edge (%) = Probabilidad real - Probabilidad implicita
-5. Edge > 0 -> valor positivo. Escala: 0-3% BAJO, 3-7% MEDIO, >7% ALTO.
+# ═══════════════════════════════════════════════════════════════
+# SYSTEM PROMPT MEJORADO CON FEW-SHOT Y AWARENESS DEL MODELO CUANTITATIVO
+# ═══════════════════════════════════════════════════════════════
 
-REGLAS DE PONDERACION OBLIGATORIAS:
-- METRICAS CUANTITATIVAS (xG, forma ultimos 5-10 partidos de ESTA temporada) pesan MAS que H2H historico.
-- El H2H es solo una referencia secundaria. Si el H2H contradice la forma actual, ignoralo.
-- Los partidos de H2H de mas de 3 anios atras son irrelevantes (plantillas y estilos cambiaron).
-- Si el H2H proviene de Champions League pero los equipos nunca se enfrentaron con estas plantillas, dale peso BAJO.
-- LESIONES/SUSPENSIONES (BSD): Los datos de bajas vienen de BSD. Usalos como REFERENCIA pero con PRECAUCION: BSD no siempre es preciso. Si un jugador aparece como lesionado en BSD pero SofaScore lo pone titular, SofaScore MANDA -> el jugador JUEGA.
-- ARBITRO: Los datos del arbitro se muestran en la seccion ARBITRO al inicio del prompt. Vienen de la mejor fuente disponible (SofaScore > WhoScored > Transfermarkt > BSD v2). Usa el promedio de la competicion del partido actual, no el total de carrera. Si el arbitro no esta asignado, omite el factor arbitral.
+FEW_SHOT_EXAMPLES = """
+═══════════════════════════════════════════════════════════
+EJEMPLOS DE ANÁLISIS (Anclajes de calidad)
+═══════════════════════════════════════════════════════════
 
-REGLAS DE REMATES (TIROS):
-- La fuente principal son los datos por partido en FORMA RECIENTE (tiros totales, al arco, corners) y los promedios de BSD (remates_promedio, remates_arco_promedio).
-- Evalua la CONSISTENCIA: no es lo mismo un equipo que mete 25 tiros siempre que uno que alterna 8 y 25. Mira el desglose.
-- Compara los tiros en Copa/Libertadores vs Liga del equipo: si en copa mete menos tiros contra rivales fuertes, ajusta expectativas.
-- SI HAY DATOS DE SHOTMAP (xG por disparo) desde BSD v2 o SofaScore, usalos para evaluar la calidad de las ocasiones.
-- Equipos con alto xG + alto volumen de remates al arco -> partido intenso ofensivamente.
-- Si ambos equipos promedian >10 remates y >4 al arco -> Over 2.5 gana peso adicional.
-- Cruza con las cuotas de tiros de Betsafe para detectar edges en mercados de tiros totales/arco.
+Ejemplo A: Proyección de tiros correcta
+Partido: Man City vs Luton | Contexto: City favorito amplio, Luton encerrado.
+Datos: City 18.2 tiros/prom local, Luton 8.1 tiros/prom visita.
+Proyección correcta: Local 19-21, Visitante 5-7, Total 25-27.
+Justificación: volumen local alto Luton no saldría del área. Rango aceptable 24-28.
 
-REGLAS DE MOMENTUM:
-- Si esta disponible el grafico de momentum de SofaScore, usalo para entender quien domino el partido.
-- El momentum mide dominio acumulado minuto a minuto (no solo posesion, sino presion ofensiva).
+Ejemplo B: Corrección por contexto (no seguir promedios ciegos)
+Partido: Boca vs River (Libertadores octavos, vuelta, 1-1 en ida).
+Datos: Boca 14.5 tiros/prom, River 13.2 tiros/prom.
+Proyección correcta: Local 12-14, Visitante 9-11, Total 22-25.
+Justificación: Derby cerrado + resultado ajustado = menos espacios. NO se proyectó 28+ tiros.
 
-REGLAS DE TARJETAS Y ARBITRO:
-- La fuente PRINCIPAL para datos de arbitro es SofaScore (si el usuario proporciona la URL): datos completos de carrera con desglose por torneo, YC/part, RC/part, totales.
-- Si no hay SofaScore, usa WhoScored/Transfermarkt como alternativa.
-- Si ninguno esta disponible, usa BSD v2 (avg_yellow_per_match, avg_fouls_per_match) como referencia.
-- SI HAY DATOS FLASHSCORE del arbitro, cruzalos con los datos de SofaScore/WhoScored.
-- IMPORTANTE: El arbitro tiene medias de tarjetas DISTINTAS segun la competicion. Usa SIEMPRE el promedio de la competicion del partido actual, no el total de carrera. Si el partido es de Libertadores, usa el promedio de Libertadores de ESE arbitro.
+Ejemplo C: Tarjetas ajustadas por árbitro + contexto
+Árbitro: 3.8 YC/partido en Libertadores. Derby. Descenso indirecto.
+Proyección correcta: Total 5.0-6.0 amarillas (más del promedio de 3.5 por contexto).
+Ajuste: árbitro estricto + tensión derby = +1.5 sobre la media conjunta.
 
-REGLAS DE ALINEACIONES / DISPONIBILIDAD DE JUGADORES:
-- LA ALINEACION DE SOFASCORE ES LA FUENTE UNICA Y DEFINITIVA de que jugadores juegan.
-- Si SofaScore tiene alineacion confirmada: esos son EXACTAMENTE los jugadores que jugaran.
-- Las BAJAS BSD son referencia SECUNDARIA. SofaScore MANDA.
-- Si hay PLANTILLA BSD v2 (squad), usala para validar que jugadores son titulares habituales vs suplentes.
-- SI HAY ESTADISTICAS POR JUGADOR (xG individual, rating, pases, duelos) desde BSD v2 player-stats, analiza que jugadores estan en mejor momento y como afectan al partido.
-- SI HAY DATOS DE DT BSD v2 (win_pct, avg_goals, clean_sheet_pct, btts_pct, over_25_pct), son metricas cuantitativas valiosas para predecir el estilo del partido. Pesan mas que la descripcion cualitativa del perfil.
+Ejemplo D: Cuota baja = mercado already priced in
+Cuota Over 2.5 goles @ 1.32. El mercado descuenta alto volumen.
+Decisión correcta: NO recomendar Under sin evidencia abrumadora. Omitir este mercado.
+"""
 
-REGLAS DE OVERCONFIDENCE:
-- Edges >10% son extremadamente raros. Verifica respaldo multiple.
-- Un edge REALISTA en futbol de elite: 3-8%.
+SYSTEM_PROMPT = f"""Eres un experto analista de MERCADOS ESTADÍSTICOS en fútbol. Tu especialidad es proyectar con precisión tiros, tarjetas, corners, goles por mitad, faltas, y demás estadísticas de partido basándote en CONTEXTO, perfiles de equipo, y datos duros. El value betting en mercados de resultado (1X2) es secundario.
 
-REGLAS DE OVER/UNDER y BTTS:
-- Para Over/Under y BTTS, la forma goleadora de ESTA TEMPORADA pesa mas.
-- Si ambos equipos tienen xG alto esta temporada (>1.5), el Over 2.5 tiene mas peso.
-- No uses el argumento "H2H historico under" si los equipos actuales juegan distinto.
-- COMPETICION: Si la forma reciente del equipo proviene de su liga local contra rivales inferiores (ej: PSG vs Le Havre), penaliza esas metricas al proyectar contra un rival de elite en Champions. Las estadisticas infladas por goleadas a equipos debiles NO se transfieren a partidos de maxima exigencia.
-- VARIANZA: No te fies solo del promedio. Mira el desglose por partido. Si un equipo metio 17 goles en 5 partidos pero 9 fueron en un solo partido contra un rival debil, su promedio real de goles es ~2.0, no 3.4. Penaliza los outliers.
-- TABLA DE POSICIONES: Usa la posicion en la tabla como contexto del momento del equipo. Un equipo puntero en su liga local pero colista en el grupo de copa indica que rinde distinto segun la competicion. Si la tabla muestra xG a favor/en contra, comparalos con los goles reales para detectar overperformance/underperformance.
+INFORMACIÓN IMPORTANTE: Antes de cada análisis, recibirás una PROYECCIÓN CUANTITATIVA BASE generada por un modelo estadístico propio. Esta base usa xG, forma reciente ponderada, posición en tabla, distancia de viaje y regresión a la media. TU trabajo es VALIDARLA, AJUSTARLA según el contexto cualitativo, y COMUNICAR un rango final con justificación. Nunca ignores la base sin explicar por qué.
 
-REGLAS DE CUOTAS:
-- Las cuotas de BETSAFE son las OFICIALES. Usalas para calcular valor.
-- Ignora cualquier otra cuota (BSD) que pueda aparecer. Betsafe manda.
-- MERCADOS DE TIROS: Si Betsafe tiene Over con cuota <1.35 en tiros totales o tiros al arco, el mercado ya descuenta volumen alto. No recomiendes Under en esos casos a menos que tengas data MUY solida que lo justifique (ej: ambos equipos promedian <8 tiros O <2 al arco en los ultimos 5 partidos de ESTA competicion). El error mas comun es subestimar el ritmo de juego en Sudamerica — los partidos de eliminacion directa y liga local generan mas volumen que la fase de grupos de copa.
+{FEW_SHOT_EXAMPLES}
 
-SE CONSERVADOR: Prefiere quedarte corto en edges a inflarlos artificialmente.
+═══════════════════════════════════════
+PROCESO DE ANÁLISIS (EN ORDEN)
+═══════════════════════════════════════
 
-DATOS CONTEXTUALES NUEVOS (BSD v2):
-- Datos pre-partido (funfacts): hechos narrativos como "X no ha perdido en N partidos". Son contexto util pero no reemplazan metrica cuantitativa.
-- Tabla de posiciones con xG: si BSD v2 provee standings con xGF/xGA/xGD, usalos para comparar rendimiento real vs esperado de cada equipo en la temporada.
-- Precisión de pases y ball-tracking: si BSD v2 da pass_accuracy_pct, attack, dangerous_attack, incorporalos al analisis de dominio. Equipos con alta precision de pases + muchos dangerous_attack generan mas ocasiones claras.
-- Travel distance y derby: si BSD v2 indica is_local_derby=true o travel_distance_km alto, ajusta expectativas (derby = mas tarjetas, viaje largo = posible fatiga visitante).
+PASO 1 - CONTEXTO DEL PARTIDO (LO MÁS IMPORTANTE):
+Antes de proyectar cualquier estadística, analiza el contexto. Sin contexto, los números no valen nada.
 
-FORMATO DE RESPUESTA (se conciso, no repitas datos):
+a) ¿QUÉ SE JUEGA? (MOTIVACIÓN):
+   - Mira la tabla de posiciones. ¿Cuántos partidos quedan en la temporada? (total equipos - 1 - PJ jugados)
+   - ¿Equipo peleando título, clasificación a copa, descenso, o sin nada en juego?
+   - ¿Es eliminatoria (ida/vuelta)? ¿El resultado de ida condiciona el planteamiento?
+   - Equipos sin nada que jugar tienden a partidos más abiertos o más apáticos. Evalúa cuál aplica según perfil del DT.
+   - Equipos en descenso directo: desesperación = mas faltas, más tarjetas, más tiros apurados.
+   - Equipo que con empate clasifica: planteamiento conservador, pocos tiros, muchas faltas tácticas.
 
-[PROBABILIDADES REALES]
+b) PERFIL DE CADA EQUIPO (ESTILO DE JUEGO):
+   - Ofensivo/defensivo: posesión alta/baja, presión alta/baja, transiciones rápidas/lentas.
+   - ¿Juega con laterales profundos? -> más corners y centros.
+   - ¿Equipo de mucho disparo exterior? -> más tiros totales pero menos al arco.
+   - ¿Equipo que fuerza faltas tácticas? -> más tarjetas rivales.
+   - ¿Juega con línea alta? -> más offsides, más espacios a la espalda.
+   - Perfil del DT: mira los datos de BSD v2 (win_pct, avg_goals, clean_sheet_pct, btts_pct, over_25_pct).
+
+c) DINÁMICA DEL PARTIDO ESPERADA:
+   - ¿Local fuerte vs visitante débil? -> local propone, visitante se encierra.
+   - ¿Dos equipos ofensivos? -> ida y vuelta, muchos tiros de ambos, Over en todo.
+   - ¿Dos equipos defensivos/calculadores? -> pocos tiros, pocos corners, muchas faltas.
+   - ¿Derby o clásico? (BSD v2: is_local_derby=true) -> MÁS tarjetas, MÁS faltas, partido cortado.
+   - ¿Viaje largo del visitante? (travel_distance_km alto) -> posible fatiga en 2do tiempo.
+   - ¿Clima extremo? -> menos ritmo, menos tiros.
+   - ¿Cancha neutral? -> quita ventaja de localía.
+
+d) ¿CUÁNTOS PARTIDOS QUEDAN?:
+   - Pocos partidos + necesidad urgente = equipos que arriesgan más.
+   - Muchos partidos + posición cómoda = ritmo relajado.
+   - Si un equipo ya está salvado/eliminado, sus estadísticas pueden empeorar frente a uno que se juega la vida.
+
+PASO 2 - VALIDACIÓN DE PROYECCIÓN CUANTITATIVA BASE:
+Recibirás números base del modelo. Tu tarea:
+1. Si están razonables dado el contexto, confirma y refina a rangos.
+2. Si discrepan significativamente, explica POR QUÉ y ajusta.
+   Ejemplos de discrepancia válida:
+   - Modelo proyecta 3.2 goles pero es derby cerrado + árbitro estricto. Ajustar a 2.2-2.5.
+   - Modelo proyecta 22 tiros total pero visitante con 5 defensas y DT ultra-defensivo. Ajustar a 16-18.
+   - Modelo proyecta 3.0 tarjetas pero árbitro histórico 4.5 YC/part en esta competición. Ajustar a 4.5-5.5.
+
+PASO 3 - PROYECCIÓN DE ESTADÍSTICAS (POR MITADES 1T/2T):
+Proyecta cada métrica con desglose. Fundamenta con datos de FORMA RECIENTE (desglose por partido), ESTADÍSTICAS DE TEMPORADA, PERFIL, y CONTEXTO.
+
+═══════════════════════════════════════
+REGLAS POR MERCADO ESTADÍSTICO
+═══════════════════════════════════════
+
+── TIROS TOTALES Y AL ARCO ──
+- Fuente primaria: desglose POR PARTIDO en FORMA RECIENTE (SofaScore). NO promedies ciegamente.
+- CONSISTENCIA: un equipo que hace 18-20-22-19-21 tiros es MUY distinto a uno que hace 8-25-6-22-9.
+- Tiros 1T vs 2T: equipos que empiezan fuertes (presión alta primeros 20 min) generan más en 1T.
+- Si el local es amplio favorito y el visitante se encierra: el local tira MUCHO (20+), el visitante tira POCO (<6).
+- Si hay shotmap con xG/xGOT: evalúa calidad de ocasion, no solo volumen.
+- Ajusta por COMPETICIÓN: tiros en liga contra rivales débiles NO se transfieren 1:1 a copa contra rivales de élite.
+- Cuota Betsafe <1.35 en Over tiros: el mercado ya descuenta volumen alto. Solo recomienda Under con evidencia ABRUMADORA.
+
+── GOLES POR MITAD (1T / 2T) ──
+- Analiza el ritmo de inicio: ¿qué equipo suele marcar temprano?
+- ¿Hay dato de goles 1T/2T en forma reciente? Usalo.
+- Equipos que presionan alto al inicio: más goles en 1T.
+- Fatiga del visitante (viaje largo, poco descanso) -> más goles en contra en 2T.
+- Si el partido es de vuelta con resultado ajustado: primer tiempo trabado, goles en 2T cuando se abren.
+
+── TARJETAS AMARILLAS ──
+- ARBITRO: fuente principal. Siempre usa el promedio de la COMPETICIÓN ACTUAL del partido.
+- Fuentes de árbitro en orden: SofaScore > ValueStats > Flashscore > WhoScored > Transfermarkt > BSD v2.
+- Derby/rivalidad = MÁS tarjetas. Equipo sin nada que jugar = MENOS tarjetas. Descenso = MÁS tarjetas.
+- TARJETAS POR MITAD:
+  - 1T: árbitros suelen ser más permisivos al inicio. Pero si hay derby o mucha tensión, pueden salir temprano.
+  - 2T: más tarjetas en promedio (fatiga, nervios, resultado apretado, pérdidas de tiempo). Ajusta al alza.
+
+── CORNERS ──
+- Fuente primaria: corners por partido en FORMA RECIENTE + promedio temporada.
+- Equipos con laterales ofensivos + centros frecuentes = corners altos.
+- Local dominante vs visitante encerrado = muchos corners locales (>7).
+- Partido cerrado y táctico = pocos corners (<8 total).
+- Por mitad: 2T suele tener más corners (equipos se vuelcan, más urgencia).
+
+── FALTAS ──
+- Fuente: promedio de faltas BSD + faltas por partido en stats SofaScore.
+- Derby/descenso = más faltas. Partido amistoso/sin nada en juego = menos faltas.
+- Árbitros rigurosos pitan más faltas. Árbitros permisivos dejan jugar.
+
+═══════════════════════════════════════
+REGLAS GENERALES DE PONDERACIÓN
+═══════════════════════════════════════
+
+- MÉTRICAS CUANTITATIVAS (xG, forma últimos 5-10 partidos de ESTA temporada) PESAN MÁS que H2H histórico.
+- H2H >3 años es IRRELEVANTE. Plantillas y estilos cambiaron.
+- VARIANZA: no te fíes del promedio. Mira el desglose por partido. Penaliza outliers.
+- COMPETICIÓN: estadísticas de liga contra rivales débiles NO se transfieren a copa contra rivales de élite.
+- LESIONES/SUSPENSIONES: SofaScore es la única fuente de quién juega. BSD es referencia secundaria.
+- SI HAY ESTADÍSTICAS POR JUGADOR: un delantero con alto xG reciente indica que el equipo genera para él.
+- No inventes datos. Si proyectas un número, fundamentalo con 2-3 razones claras.
+- SE CONSERVADOR: prefiere quedarte corto en proyecciones a inflarlas. Un error de +3 tiros proyectados es peor que -3.
+- IMPORTANTE: Incluye una nota de CONFIANZA para cada proyección principal (Alta/Media/Baja) según la calidad de los datos disponibles.
+
+═══════════════════════════════════════
+CUOTAS DE BETSAFE
+═══════════════════════════════════════
+- Betsafe es la fuente OFICIAL de cuotas. Ignora BSD.
+- Mercados estadísticos disponibles (varian por partido): Total de Tiros (TSTOUM), Tiros al Arco (TOSG), Total Corners (TOCO), Total Amarillas (TOYC), Goles 1T (1HTG), Goles 2T (2HTG), BTTS 1T/2T.
+- Para calcular edge en mercados estadísticos: compara tu proyección con la línea de Betsafe.
+- Si cuota Over en algún mercado es <1.35, el mercado ya descuenta volumen alto. Solo recomienda Under con evidencia abrumadora.
+
+FORMATO DE RESPUESTA (sé conciso, no repitas datos ya mostrados en el prompt):
+
+[CONTEXTO DEL PARTIDO]
+- ¿Qué se juega? (título/descenso/clasificación/nada). Partidos restantes.
+- Perfil de cada equipo (estilo de juego, posesión, presión, laterales, disparo).
+- Dinámica esperada (local propone/visitante encierra, ida y vuelta, cerrado/táctico, derby).
+- Factores de motivación y urgencia.
+(4-6 líneas máximo)
+
+[VALIDACIÓN MODELO CUANTITATIVO]
+- Base del modelo: goles X.X-Y.Y, tiros X-Y, corners X-Y, tarjetas X-Y.
+- ¿Coincide o discrepa con tu análisis cualitativo? Justifica ajustes.
+
+[PROYECCIÓN DE TIROS]
+Totales: Local X-Y Visitante (Total: Z) | Al arco: Local X-Y Visitante (Total: Z)
+1T: Loc X-Y Vis (Arco: X-Y) | 2T: Loc X-Y Vis (Arco: X-Y)
+Justificación (2-3 líneas, menciona consistencia y contexto)
+
+[PROYECCIÓN DE GOLES POR MITAD]
+1T: Over/Under X.X goles esperados | 2T: Over/Under X.X goles esperados
+Razonamiento (ritmo esperado, quién marca primero, fatiga, urgencia)
+
+[PROYECCIÓN DE AMARILLAS]
+Local: X | Visitante: Y | Total: Z | 1T: ~X | 2T: ~Y
+Árbitro: [nombre] - [estilo: permisivo/moderado/estricto] - media YC en esta competición: X.X
+Justificación (rivalidad, perfil de faltas de cada equipo, contexto)
+
+[PROYECCIÓN DE CORNERS]
+1T: X-Y | 2T: X-Y | Total: Z
+Justificación (estilo ofensivo, laterales, centros, urgencia en 2T)
+
+[PROYECCIÓN DE FALTAS]
+Total: ~Z faltas
+Justificación (1 línea)
+
+[SAQUES DE BANDA] (omitir si no hay suficiente info para inferir)
+Estimación cualitativa: rango bajo/medio/alto. Explicación breve.
+
+[MERCADOS ESTADÍSTICOS CON VALOR]
+Mercado | Selección | Línea/Cuota Betsafe | Proyección | Edge estimado | Confianza
+(Solo filas con edge positivo en mercados estadísticos. Si no hay cuotas comparables de Betsafe para un mercado, no lo incluyas.)
+
+[KELLY STAKES RECOMENDADOS]
+(Opcional, si hay picks claros: cuánto apostar según Kelly Criterion fraccional)
+
+[RESUMEN 1X2/OVER/BTTS] (solo si hay datos suficientes, prioridad baja)
 1X2: L=X% / E=X% / V=X% | BTTS: Si=X% / No=X% | O2.5: Over=X% / Under=X%
-(2-3 frases de justificacion por mercado)
+(1 línea de justificación por mercado)
 
-[TIROS Y REMATES]
-Estimacion de tiros totales y al arco (promedio esperado para el partido).
-Justificacion: basada en los datos por partido de la seccion FORMA RECIENTE y cuotas de Betsafe.
-
-[TARJETAS]
-Amarillas esperadas (rango bajo/medio/alto). Menciona al arbitro y su media en ESTA competicion especifica.
-
-[CORNERS]
-Estimacion de corners totales basada en datos por partido (FORMA RECIENTE) y cuotas de Betsafe.
-
-[EDGE]
-Tabla: Mercado | Seleccion | Cuota | Prob.Real | Prob.Implicita | Edge | Confianza
-(Solo filas con edge > 0. Si no hay, indicalo)
-
-[RECOMENDACION]
-Mejor apuesta con valor (1-2 lineas). Si no hay valor, dilo.
-Si hay contexto favorable para tiros/amarillas/corners, menciona como nota adicional.
-Si el mercado de Betsafe marca Over con cuota muy baja (<1.35), alineate con el mercado salvo evidencia abrumadora en contra."""
-
+[RECOMENDACIÓN FINAL]
+Mejor mercado estadístico con valor y por qué. Si no hay valor claro en estadísticas, dilo.
+Menciona el factor contextual MÁS RELEVANTE que define el partido."""
 
 
 def _formatear_arbitro_header(datos: dict) -> str:
-    """Arbitro inline en el header del prompt, usando la mejor fuente disponible."""
+    """Árbitro inline en el header del prompt."""
     arb = datos.get("arbitro")
     if not arb:
         return "ARBITRO NO ASIGNADO. No asumas nada sobre su estilo; omite el factor arbitral."
@@ -175,10 +291,9 @@ def _formatear_arbitro_header(datos: dict) -> str:
         if ref_data.get("faltas_pp") is not None:
             partes.append(f"- Faltas/partido: {ref_data['faltas_pp']}")
 
-        # Torneos con promedios (solo los mas relevantes)
         torneos = ref_data.get("torneos", ref_data.get("competiciones", []))
         if torneos:
-            partes.append("- Promedios por competicion:")
+            partes.append("- Promedios por competición:")
             for t in torneos[:8]:
                 tn = t.get("nombre", "?")
                 yc = t.get("yc_pp", "?")
@@ -201,7 +316,7 @@ def _formatear_arbitro_header(datos: dict) -> str:
 
 
 def _formatear_forma_bsd_compact(datos: dict) -> str:
-    """Formato compacto de la forma BSD (solo promedios clave, sin JSON verboso)."""
+    """Formato compacto de la forma BSD."""
     partes = []
     for lado, key in [("Local", "forma_local"), ("Visitante", "forma_visitante")]:
         f = datos.get(key, {})
@@ -214,17 +329,27 @@ def _formatear_forma_bsd_compact(datos: dict) -> str:
     return "\n".join(partes)
 
 
-def _crear_prompt_usuario(datos_resumidos: dict, prediccion_resumida: dict) -> str:
-    """
-    Construye el prompt de usuario con los datos del partido formateados.
+def _formatear_proyeccion_cuantitativa(quant: dict) -> str:
+    """Crea una sección legible con la proyección base del modelo cuantitativo."""
+    if not quant:
+        return "(No se generó proyección cuantitativa base)"
+    lines = [
+        "PROYECCION CUANTITATIVA BASE (modelo estadístico):",
+        f"  Goles: Local {quant.get('goals_local', '?')} - Visitante {quant.get('goals_visitor', '?')} (Total: {quant.get('total_goals', '?')})",
+        f"  Tiros: Local {quant.get('tiros_local', '?')} - Visitante {quant.get('tiros_visitor', '?')} (Total: {quant.get('tiros_total', '?')})",
+        f"  Tiros al Arco: L {quant.get('tiros_arco_local', '?')} - V {quant.get('tiros_arco_visitor', '?')}",
+        f"  Corners: ~{quant.get('corners_total', '?')} total",
+        f"  Amarillas: ~{quant.get('yc_total', '?')} total",
+        f"  Faltas: ~{quant.get('fouls', '?')}",
+        f"  Prob BTTS: {quant.get('btts_yes', '?')} | Prob Over 2.5: {quant.get('over25_yes', '?')}",
+        "---",
+        "Valida estos números con el contexto. Si discrepan, ajusta y explica por qué.",
+    ]
+    return "\n".join(lines)
 
-    Args:
-        datos_resumidos: Datos resumidos del partido desde bsd_client + sofascore_client.
-        prediccion_resumida: Predicción ML resumida desde bsd_client.
 
-    Returns:
-        String con el prompt formateado.
-    """
+def _crear_prompt_usuario(datos_resumidos: dict, prediccion_resumida: dict, quant_projections: dict) -> str:
+    """Construye el prompt de usuario con los datos del partido formateados."""
     prompt = f"""
 ## DATOS DEL PARTIDO
 
@@ -233,10 +358,15 @@ Liga: {datos_resumidos.get('liga', 'Desconocida')}
 Fecha: {datos_resumidos.get('fecha', 'Desconocida')}
 {f"Estadio: {datos_resumidos.get('estadio', {}).get('nombre', '?')} ({datos_resumidos.get('estadio', {}).get('ciudad', '?')}, cap: {datos_resumidos.get('estadio', {}).get('capacidad', '?')})" if datos_resumidos.get('estadio') else ""}
 
-### ÁRBITRO
+PRIORIDAD: Proyecta estadísticas del partido (tiros, goles por mitad, amarillas, corners, faltas). El análisis 1X2/BTTS/Over es SECUNDARIO. Enfócate en el CONTEXTO.
+
+### PROYECCIÓN CUANTITATIVA BASE
+{_formatear_proyeccion_cuantitativa(quant_projections)}
+
+### ARBITRO
 {_formatear_arbitro_header(datos_resumidos)}
 
-### CUOTAS DEL BOOKMAKER
+### CUOTAS DEL BOOKMAKER (Betsafe)
 {_formatear_cuotas_betsafe_para_prompt(datos_resumidos.get('_cuotas', {})) if datos_resumidos.get('_cuotas') else f'''- Local: {datos_resumidos['cuotas'].get('local', 'N/D')}
 - Empate: {datos_resumidos['cuotas'].get('empate', 'N/D')}
 - Visitante: {datos_resumidos['cuotas'].get('visitante', 'N/D')}
@@ -248,48 +378,40 @@ Fecha: {datos_resumidos.get('fecha', 'Desconocida')}
 ### FORMA BSD (agregados)
 {_formatear_forma_bsd_compact(datos_resumidos)}
 
-### HEAD TO HEAD (últimos 3 años)
-- NOTA: Solo se muestran enfrentamientos recientes. El H2H antiguo (>3 años) fue excluido porque las plantillas y estilos cambiaron.
-{f"- {json.dumps(datos_resumidos.get('h2h', {}), indent=2, ensure_ascii=False)}" if datos_resumidos.get('h2h') and datos_resumidos['h2h'].get('total_partidos') else "- No hay enfrentamientos previos registrados entre estos equipos. Ignora el factor H2H para este analisis."}
-
-### NOTA SOBRE DATOS DISPONIBLES
-- REMATES Y TIROS: La seccion FORMA RECIENTE muestra tiros totales, al arco, amarillas y corners por partido. Complementa con los promedios de BSD (remates_promedio, remates_arco_promedio).
-- AMARILLAS: La seccion FORMA RECIENTE muestra YC por partido. Cruza con los datos del arbitro en DATOS ADICIONALES.
-- CORNERS: La seccion FORMA RECIENTE muestra corners por partido. Complementa con las cuotas de corners de Betsafe.
-- COMPETICION: La forma reciente esta separada por torneo (Copa/Torneo vs Liga). Evalua el rendimiento en la competicion actual del partido.
-- FATIGA: Usa el PPG y la forma reciente como proxy de fatiga/ritmo.
-- LESIONES: SofaScore YA NO proporciona datos de lesiones via API. Usa BAJAS BSD como referencia secundaria. La alineacion de SofaScore es quien define quien JUEGA.
-
-### ALINEACION DEL PARTIDO (SofaScore)
-- La alineacion de SofaScore es la unica fuente de disponibilidad de jugadores.
-- Si hay CONFLICTOS BSD vs SofaScore, SofaScore MANDA (el jugador JUEGA).
-{f"### ALINEACION CONFIRMADA (SofaScore)\n- {json.dumps(datos_resumidos.get('_sofascore', {}).get('alineaciones', {}), indent=2, ensure_ascii=False)}" if datos_resumidos.get("_sofascore", {}).get("alineaciones", {}).get("local", {}).get("confirmada") else ""}
-{f"### ALINEACION PRELIMINAR (NO CONFIRMADA)\n- {json.dumps(datos_resumidos.get('_sofascore', {}).get('alineaciones', {}), indent=2, ensure_ascii=False)}" if datos_resumidos.get("_sofascore", {}).get("alineaciones") and not datos_resumidos.get("_sofascore", {}).get("alineaciones", {}).get("local", {}).get("confirmada") else ""}
-{f"### SIN ALINEACION DISPONIBLE\n- SofaScore no tiene alineacion todavia (suele salir ~1h antes del partido). Asume plantilla tipo con los jugadores habituales." if not datos_resumidos.get("_sofascore", {}).get("alineaciones") else ""}
-
-### BAJAS BSD (lesionados/suspendidos - referencia secundaria)
-{json.dumps(datos_resumidos.get('bajas_bsd', {}), indent=2, ensure_ascii=False)}
-- NOTA: Estas bajas son de BSD, NO de SofaScore. Usalas con precaucion.
-- Si un jugador esta aqui Y NO en la alineacion de SofaScore → probable baja real.
-- Si un jugador esta aqui Y SI en la alineacion de SofaScore → JUEGA (conflicto resuelto a favor de SofaScore).
+### TABLA DE POSICIONES
+{_format_standings_section(datos_resumidos)}
+IMPORTANTE: Usa la tabla para determinar CUANTOS PARTIDOS QUEDAN (total equipos - 1 = partidos en la temporada, resta los PJ de cada equipo). Si un equipo ya completó su cupo o le quedan pocos partidos, eso define la urgencia y motivación.
 
 ### ESTILOS DE ENTRENADORES
 - Local: {json.dumps(datos_resumidos.get('entrenador_local', {}), indent=2, ensure_ascii=False)}
 - Visitante: {json.dumps(datos_resumidos.get('entrenador_visitante', {}), indent=2, ensure_ascii=False)}
 
-### PREDICCIÓN ML (BSD CatBoost)
-- Probabilidades 1X2: L={prediccion_resumida.get('prob_local', 'N/D')}% / E={prediccion_resumida.get('prob_empate', 'N/D')}% / V={prediccion_resumida.get('prob_visitante', 'N/D')}%
+### HEAD TO HEAD (últimos 3 años)
+- NOTA: Solo se muestran enfrentamientos recientes. El H2H antiguo (>3 años) fue excluido.
+{f"- {json.dumps(datos_resumidos.get('h2h', {}), indent=2, ensure_ascii=False)}" if datos_resumidos.get('h2h') and datos_resumidos['h2h'].get('total_partidos') else "- No hay enfrentamientos previos registrados. Ignora el factor H2H."}
+
+### PREDICCION ML (BSD CatBoost) - Referencia secundaria
+- Probabilidades 1X2: L={prediccion_resumida.get('prob_local', 'N/D')}% / E={prediccion_resumida.get('prob_empate', 'N/D')}% / V={prediccion_resumida.get('prob_visitante', 'N/D')}%"
 - xG esperado: Local {prediccion_resumida.get('xG_local', 'N/D')} - Visitante {prediccion_resumida.get('xG_visitante', 'N/D')}
 - Prob. Over 2.5: {prediccion_resumida.get('prob_over_25', 'N/D')}%
 - Prob. BTTS: {prediccion_resumida.get('prob_btts', 'N/D')}%
 - Marcador más probable: {prediccion_resumida.get('marcador_probable', 'N/D')}
 - Confianza del modelo: {prediccion_resumida.get('confianza_modelo', 'N/D')}
 
-### TABLA DE POSICIONES
-{_format_standings_section(datos_resumidos)}
+### ALINEACIÓN DEL PARTIDO (SofaScore)
+- La alineación de SofaScore es la única fuente de disponibilidad de jugadores.
+- Si hay CONFLICTOS BSD vs SofaScore, SofaScore MANDA (el jugador JUEGA).
+{f"### ALINEACIÓN CONFIRMADA (SofaScore)\\n- {json.dumps(datos_resumidos.get('_sofascore', {}).get('alineaciones', {}), indent=2, ensure_ascii=False)}" if datos_resumidos.get("_sofascore", {}).get("alineaciones", {}).get("local", {}).get("confirmada") else ""}
+{f"### ALINEACIÓN PRELIMINAR (NO CONFIRMADA)\\n- {json.dumps(datos_resumidos.get('_sofascore', {}).get('alineaciones', {}), indent=2, ensure_ascii=False)}" if datos_resumidos.get("_sofascore", {}).get("alineaciones") and not datos_resumidos.get("_sofascore", {}).get("alineaciones", {}).get("local", {}).get("confirmada") else ""}
+{f"### SIN ALINEACIÓN DISPONIBLE\\n- SofaScore no tiene alineación todavía (suele salir ~1h antes del partido). Asume plantilla tipo." if not datos_resumidos.get("_sofascore", {}).get("alineaciones") else ""}
+
+### BAJAS BSD (lesionados/suspendidos - referencia secundaria)
+{json.dumps(datos_resumidos.get('bajas_bsd', {}), indent=2, ensure_ascii=False)}
+- NOTA: Si un jugador está aquí Y NO en SofaScore -> probable baja real.
+- Si un jugador está aquí Y SÍ en SofaScore -> JUEGA.
 
 ---
-Analiza los datos anteriores y proporciona tu evaluacion de value betting siguiendo el formato establecido.
+## DATOS ESTADÍSTICOS DETALLADOS (fuente principal para proyecciones)
 
     {_formatear_detalle_evento_para_prompt(datos_resumidos)}
     {_formatear_h2h_sofascore_para_prompt(datos_resumidos)}
@@ -307,12 +429,15 @@ Analiza los datos anteriores y proporciona tu evaluacion de value betting siguie
 ---
 ## DATOS ADICIONALES BSD v2
 {_v2_sections(datos_resumidos)}
+
+---
+Analiza los datos anteriores. PRIORIZA las proyecciones estadísticas (tiros, goles por mitad, amarillas, corners, faltas). Usa el CONTEXSO como base de todas tus proyecciones. El análisis 1X2/BTTS/Over 2.5 es SECUNDARIO y debe ir al final.
 """
     return prompt
 
 
 def _format_standings_section(datos_resumidos: dict) -> str:
-    """Muestra standings de todas las fuentes, o mensaje si no hay."""
+    """Muestra standings de todas las fuentes."""
     partes = [
         _formatear_standings_para_prompt(datos_resumidos),
         _formatear_standings_flashscore_para_prompt(datos_resumidos),
@@ -323,7 +448,6 @@ def _format_standings_section(datos_resumidos: dict) -> str:
 
 
 def _v2_standings_section(datos_resumidos: dict) -> str:
-    """Standings desde BSD v2, mostrados en la seccion principal."""
     v2 = datos_resumidos.get("_bsd_v2", {})
     if not v2:
         return ""
@@ -333,14 +457,12 @@ def _v2_standings_section(datos_resumidos: dict) -> str:
 
 
 def _v2_sections(datos_resumidos: dict) -> str:
-    """Construye las secciones de datos enriquecidos via BSD v2."""
+    """Construye las secciones de datos enriquecidos vía BSD v2."""
     v2 = datos_resumidos.get("_bsd_v2", {})
     if not v2:
-        return "(No se obtuvieron datos adicionales de BSD v2 para este partido)"
+        return "(No se obtuvieron datos adicionales de BSD v2)"
 
     partes = []
-
-    # Detalle v2 (weather, derby, travel, etc.)
     detail = datos_resumidos.get("_v2_detail", {})
     if detail:
         has_any = any(detail.get(k) for k in ["is_local_derby", "is_neutral_ground"])
@@ -356,19 +478,12 @@ def _v2_sections(datos_resumidos: dict) -> str:
                 ln.append(f"- Distancia de viaje visitante: {detail['travel_distance_km']} km")
             if detail.get("weather") and detail["weather"].get("description"):
                 w = detail["weather"]
-                ln.append(f"- Clima: {w['description']} (codigo {w.get('code')})")
+                ln.append(f"- Clima: {w['description']} (código {w.get('code')})")
             partes.append("\n".join(ln))
 
-    # Stats v2
     partes.append(resumir_stats_v2_para_prompt(v2))
-
-    # Player stats v2
     partes.append(resumir_player_stats_v2_para_prompt(v2))
-
-    # Metadata v2
     partes.append(resumir_metadata_v2_para_prompt(v2))
-
-    # Squads v2
     partes.append(resumir_squads_v2_para_prompt(v2))
 
     return "\n".join(p for p in partes if p.strip())
@@ -402,62 +517,272 @@ def _call_deepseek(client, prompt_usuario: str, include_reasoning: bool = True) 
     return contenido, razonamiento, finish_reason
 
 
+# ═══════════════════════════════════════════════════════════════
+# FUNCIÓN PRINCIPAL MEJORADA
+# ═══════════════════════════════════════════════════════════════
+
 def analizar_partido(datos_resumidos: dict, prediccion_resumida: dict) -> str:
     """
-    Envía los datos del partido a DeepSeek via OpenRouter para análisis.
-
-    Args:
-        datos_resumidos: Datos resumidos del partido.
-        prediccion_resumida: Predicción ML resumida.
-
-    Returns:
-        Respuesta de texto del análisis.
-
-    Raises:
-        ValueError: Si la API key no está configurada.
-        Exception: Si la llamada a la API falla.
+    Análisis completo con modelo cuantitativo + LLM + persistencia.
+    Mantiene la firma original para compatibilidad.
     """
     if not OPENROUTER_API_KEY:
-        raise ValueError(
-            "OPENROUTER_API_KEY no configurada. Agrégala en el archivo .env"
-        )
+        raise ValueError("OPENROUTER_API_KEY no configurada. Agrégala en el archivo .env")
 
-    client = OpenAI(
-        base_url=OPENROUTER_BASE_URL,
-        api_key=OPENROUTER_API_KEY,
+    # 1. Inicializar DB
+    db.init_db()
+
+    # 2. Ejecutar modelo cuantitativo
+    print("  [QuantModel] Calculando proyecciones base...")
+    quant_projections, features = run_full_projection(datos_resumidos, prediccion_resumida)
+    print(f"  [QuantModel] Goles: {quant_projections.get('goals_local')}-{quant_projections.get('goals_visitor')} | "
+          f"Tiros: {quant_projections.get('tiros_total')} | Corners: {quant_projections.get('corners_total')} | "
+          f"YC: {quant_projections.get('yc_total')}")
+
+    # 3. Elegir modo de análisis LLM
+    if USE_AGENT_PIPELINE:
+        print("  [Analyzer] Usando pipeline de agentes (3 pasos)...")
+        from agents_pipeline import run_pipeline, format_full_output
+        ctx, proj, val = run_pipeline(datos_resumidos, prediccion_resumida, quant_projections, {
+            "btts_yes": quant_projections.get("btts_yes"),
+            "over25_yes": quant_projections.get("over25_yes"),
+        })
+        analysis_text = format_full_output(ctx, proj, val)
+
+        # Extraer proyecciones del LLM del texto para guardar en DB (simplificado)
+        llm_projections = _extract_llm_projections(proj + "\n" + val)
+    else:
+        print("  [Analyzer] Usando prompt monolítico mejorado...")
+        client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY)
+        prompt_usuario = _crear_prompt_usuario(datos_resumidos, prediccion_resumida, quant_projections)
+
+        contenido, razonamiento, finish_reason = _call_deepseek(client, prompt_usuario, include_reasoning=True)
+        if contenido is None:
+            print("  [DeepSeek] Agotó tokens en reasoning, reintentando sin reasoning...")
+            contenido, razonamiento, finish_reason = _call_deepseek(client, prompt_usuario, include_reasoning=False)
+        if contenido is None:
+            raise RuntimeError("El modelo no devolvió contenido visible.")
+        if finish_reason == "length":
+            print(f"  [ADVERTENCIA] Respuesta truncada. Considera aumentar MAX_TOKENS.")
+        if razonamiento:
+            print(f"  [DeepSeek] Razonó {len(razonamiento)} chars internamente")
+
+        analysis_text = contenido
+        llm_projections = _extract_llm_projections(analysis_text)
+
+    # 4. Evaluar Kelly stakes y agregar al output
+    kelly_section = _build_kelly_section(datos_resumidos, quant_projections)
+    if kelly_section:
+        analysis_text += f"\n\n═══════════════════════════════════════════\nRECOMENDACIONES CUANTITATIVAS (Kelly Criterion)\n═══════════════════════════════════════════\n{kelly_section}"
+
+    # 5. Guardar en base de datos
+    match_id = str(datos_resumidos.get("id", datos_resumidos.get("match_id", "unknown")))
+    match_name = datos_resumidos.get("partido", "Desconocido")
+    league = datos_resumidos.get("liga", "Desconocida")
+    match_date = datos_resumidos.get("fecha", "")
+    betsafe_odds = datos_resumidos.get("_cuotas", datos_resumidos.get("cuotas", {}))
+
+    pred_id = db.save_prediction(
+        match_id=match_id,
+        match_name=match_name,
+        league=league,
+        match_date=match_date,
+        quant_projections=quant_projections,
+        llm_projections=llm_projections,
+        betsafe_odds=betsafe_odds,
+        bsd_pred=prediccion_resumida,
+        features=features,
     )
+    print(f"  [DB] Predicción guardada con ID={pred_id}")
 
-    prompt_usuario = _crear_prompt_usuario(datos_resumidos, prediccion_resumida)
+    # 6. Guardar bets recomendadas en DB
+    _save_recommended_bets(pred_id, match_id, datos_resumidos, quant_projections)
 
-    # Primer intento: con reasoning
-    contenido, razonamiento, finish_reason = _call_deepseek(client, prompt_usuario, include_reasoning=True)
+    return analysis_text
 
-    # Si no hay contenido visible (reasoning consumió todos los tokens), reintentar sin reasoning
-    if contenido is None:
-        print("\n  [DeepSeek agotó tokens en razonamiento, reintentando sin reasoning...]")
-        contenido, razonamiento, finish_reason = _call_deepseek(client, prompt_usuario, include_reasoning=False)
 
-    if contenido is None:
-        raise RuntimeError(
-            "El modelo no devolvió contenido visible en ningun intento. "
-            "Reduce los datos del prompt o aumenta MAX_TOKENS."
+def _extract_llm_projections(text: str) -> dict:
+    """Extrae proyecciones del texto del LLM de forma heurística para guardar en DB."""
+    import re
+    proj = {}
+    # Goles
+    m = re.search(r"(?:goles|Goles)\s*:?\s*Local\s*(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)\s*Visitante", text, re.IGNORECASE)
+    if m:
+        proj["goals_local"] = float(m.group(1))
+        proj["goals_visitor"] = float(m.group(2))
+
+    # Tiros total
+    m = re.search(r"(?:Tiros totales|Total.*tiros)\s*:?\s*(\d+(?:\.\d+)?)", text, re.IGNORECASE)
+    if m:
+        proj["tiros_total"] = float(m.group(1))
+
+    # Corners total
+    m = re.search(r"(?:Corners total|Total.*corners)\s*:?\s*(\d+(?:\.\d+)?)", text, re.IGNORECASE)
+    if m:
+        proj["corners_total"] = float(m.group(1))
+
+    # Amarillas total
+    m = re.search(r"(?:Amarillas total|Total.*amarillas|YC total)\s*:?\s*(\d+(?:\.\d+)?)", text, re.IGNORECASE)
+    if m:
+        proj["yc_total"] = float(m.group(1))
+
+    # Recommendation
+    m = re.search(r"\[RECOMENDACI[ÓO]N FINAL\](.+?)(?:\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        proj["recommendation"] = m.group(1).strip()[:500]
+
+    # Confidence
+    m = re.search(r"confianza\s*:?\s*(Alta|Media|Baja)", text, re.IGNORECASE)
+    if m:
+        proj["confidence"] = m.group(1).capitalize()
+
+    return proj
+
+
+def _build_kelly_section(datos_resumidos: dict, quant_projections: dict) -> str:
+    """Construye la sección de Kelly stakes para mercados clave."""
+    betsafe = datos_resumidos.get("_cuotas", datos_resumidos.get("cuotas", {}))
+    markets = betsafe.get("markets", betsafe)
+    if not markets or not isinstance(markets, dict):
+        return ""
+
+    lines = []
+
+    # Evaluar mercados estadísticos si hay líneas
+    # Nota: Las líneas exactas de Betsafe para stats suelen estar en markets como TSTOUM, TOCO, TOYC
+    # Extraemos las líneas de forma heurística si existen
+    for market_key in ["TSTOUM", "TOCO", "TOYC", "TOSG"]:
+        market = markets.get(market_key)
+        if not market:
+            continue
+        # Normalmente Betsafe devuelve dict con 'over' y 'under' o 'line' + 'odds'
+        over_odds = None
+        under_odds = None
+        line = None
+        if isinstance(market, dict):
+            over_odds = market.get("over", market.get("Over"))
+            under_odds = market.get("under", market.get("Under"))
+            line = market.get("line", market.get("linea"))
+            if line is None and isinstance(over_odds, dict):
+                line = over_odds.get("line")
+                over_odds = over_odds.get("odds", over_odds.get("cuota"))
+            if line is None and isinstance(under_odds, dict):
+                line = under_odds.get("line")
+                under_odds = under_odds.get("odds", under_odds.get("cuota"))
+
+        if line is None or over_odds is None or under_odds is None:
+            continue
+
+        metric_map = {"TSTOUM": "tiros", "TOCO": "corners", "TOYC": "tarjetas", "TOSG": "tiros al arco"}
+        proj_total = None
+        if market_key == "TSTOUM":
+            proj_total = quant_projections.get("tiros_total")
+        elif market_key == "TOCO":
+            proj_total = quant_projections.get("corners_total")
+        elif market_key == "TOYC":
+            proj_total = quant_projections.get("yc_total")
+
+        if proj_total is None:
+            continue
+
+        recs = evaluate_stat_market(
+            mercado=metric_map.get(market_key, market_key),
+            linea=float(line),
+            cuota_over=float(over_odds),
+            cuota_under=float(under_odds),
+            proj_total=proj_total,
+            proj_std=2.0,
         )
+        if recs:
+            formatted = format_recommendations(recs)
+            if formatted and "Ninguna" not in formatted:
+                lines.append(f"  {market_key} (línea {line}):")
+                lines.append(formatted)
 
-    if finish_reason == "length":
-        print(f"\n  [ADVERTENCIA] Respuesta truncada (finish_reason='length'). "
-              f"Considera aumentar MAX_TOKENS (actual: {MAX_TOKENS})")
+    # Evaluar 1X2 si hay cuotas
+    cl = markets.get("1X2", {}).get("local") if isinstance(markets.get("1X2"), dict) else betsafe.get("local")
+    cd = markets.get("1X2", {}).get("empate") if isinstance(markets.get("1X2"), dict) else betsafe.get("empate")
+    cv = markets.get("1X2", {}).get("visitante") if isinstance(markets.get("1X2"), dict) else betsafe.get("visitante")
 
-    if razonamiento:
-        print(f"\n  [DeepSeek razonó {len(razonamiento)} chars internamente]")
+    if cl and cd and cv:
+        # Calibrar probs usando quant_model
+        pl = calibrate_probability(quant_projections.get("btts_yes") or 0.5)  # fallback
+        # mejor: inferir de goles proyectados via Poisson aproximado
+        import math
+        gl = quant_projections.get("goals_local", 1.2)
+        gv = quant_projections.get("goals_visitor", 1.0)
+        # Aproximación muy básica para 1X2 desde goles esperados
+        lambda_sum = gl + gv
+        # Esto es solo un placeholder; el agente de valor del pipeline hace esto mejor
+        # Por ahora, omitimos 1X2 Kelly en el output directo si no hay probs claras
+        pass
 
-    return contenido
+    return "\n".join(lines) if lines else ""
+
+
+def _save_recommended_bets(pred_id: int, match_id: str, datos_resumidos: dict, quant_projections: dict):
+    """Registra en DB las apuestas recomendadas por Kelly."""
+    betsafe = datos_resumidos.get("_cuotas", datos_resumidos.get("cuotas", {}))
+    markets = betsafe.get("markets", betsafe)
+    if not markets or not isinstance(markets, dict):
+        return
+
+    for market_key in ["TSTOUM", "TOCO", "TOYC"]:
+        market = markets.get(market_key)
+        if not market or not isinstance(market, dict):
+            continue
+        over_odds = market.get("over", market.get("Over"))
+        under_odds = market.get("under", market.get("Under"))
+        line = market.get("line", market.get("linea"))
+        if isinstance(over_odds, dict):
+            line = line or over_odds.get("line")
+            over_odds = over_odds.get("odds", over_odds.get("cuota"))
+        if isinstance(under_odds, dict):
+            line = line or under_odds.get("line")
+            under_odds = under_odds.get("odds", under_odds.get("cuota"))
+        if line is None or over_odds is None or under_odds is None:
+            continue
+
+        metric_map = {"TSTOUM": "tiros", "TOCO": "corners", "TOYC": "tarjetas"}
+        proj_total = None
+        if market_key == "TSTOUM":
+            proj_total = quant_projections.get("tiros_total")
+        elif market_key == "TOCO":
+            proj_total = quant_projections.get("corners_total")
+        elif market_key == "TOYC":
+            proj_total = quant_projections.get("yc_total")
+
+        if proj_total is None:
+            continue
+
+        recs = evaluate_stat_market(
+            mercado=metric_map.get(market_key, market_key),
+            linea=float(line),
+            cuota_over=float(over_odds),
+            cuota_under=float(under_odds),
+            proj_total=proj_total,
+            proj_std=2.0,
+        )
+        for r in recs:
+            if r.recomendado:
+                db.save_bet(
+                    prediction_id=pred_id,
+                    match_id=match_id,
+                    mercado=r.mercado,
+                    seleccion=r.seleccion,
+                    cuota=r.cuota,
+                    stake=r.stake,
+                    unidades=r.unidades,
+                    stake_pct=r.stake_pct,
+                    kelly_edge=r.kelly_edge,
+                    kelly_fraction=r.kelly_fraction,
+                )
 
 
 if __name__ == "__main__":
-    print("=== Probando Analyzer ===\n")
-
-    # Datos de ejemplo para prueba (sin consumir APIs reales)
+    print("=== Probando Analyzer v2 ===\n")
     datos_ejemplo = {
+        "id": "test-match-001",
         "partido": "Barcelona vs Real Madrid",
         "liga": "La Liga",
         "fecha": "2026-04-30T21:00:00+02:00",
@@ -470,11 +795,15 @@ if __name__ == "__main__":
             "forma_string": "WWDLW", "victorias": 3, "empates": 1, "derrotas": 1,
             "goles_favor_ultimos_n": 11, "goles_contra_ultimos_n": 4,
             "xG_promedio": 1.8, "xG_contra_promedio": 0.9,
+            "remates_promedio": 15, "remates_arco_promedio": 5.2,
+            "amarillas_promedio": 1.5, "faltas_promedio": 10,
         },
         "forma_visitante": {
             "forma_string": "WDLWW", "victorias": 3, "empates": 1, "derrotas": 1,
             "goles_favor_ultimos_n": 9, "goles_contra_ultimos_n": 5,
             "xG_promedio": 1.5, "xG_contra_promedio": 1.1,
+            "remates_promedio": 13, "remates_arco_promedio": 4.1,
+            "amarillas_promedio": 1.8, "faltas_promedio": 12,
         },
         "h2h": {
             "total_partidos": 10, "victorias_local": 4, "empates": 2,
@@ -483,9 +812,11 @@ if __name__ == "__main__":
         },
         "entrenador_local": {"nombre": "Flick", "formacion": "4-2-3-1", "perfil": "attacking"},
         "entrenador_visitante": {"nombre": "Ancelotti", "formacion": "4-3-3", "perfil": "balanced"},
+        "_sofascore": {"alineaciones": {"local": {"confirmada": True}}},
+        "home_team": "Barcelona",
+        "away_team": "Real Madrid",
     }
-
-    prediccion_ejemplo = {
+    pred_ejemplo = {
         "prob_local": 45.0, "prob_empate": 25.0, "prob_visitante": 30.0,
         "xG_local": 1.7, "xG_visitante": 1.2,
         "prob_over_25": 65.0, "prob_btts": 60.0,
@@ -494,7 +825,7 @@ if __name__ == "__main__":
     }
 
     try:
-        resultado = analizar_partido(datos_ejemplo, prediccion_ejemplo)
+        resultado = analizar_partido(datos_ejemplo, pred_ejemplo)
         print(resultado)
     except Exception as e:
         print(f"Error: {e}")

@@ -1,11 +1,12 @@
 """
-Punto de entrada interactivo de betting-ai.
+Punto de entrada interactivo de betting-ai v2.
 
 Menú en consola para:
-   1. Ver próximos partidos de ligas europeas y torneos internacionales
-   2. Seleccionar un partido por número
-   3. Obtener todos los datos automáticamente (BSD + SofaScore)
-   4. Mostrar el análisis completo de DeepSeek
+   1. Ver próximos partidos
+   2. Seleccionar partido y analizar (con modelo cuantitativo + LLM + persistencia)
+   3. Ver performance del sistema (MAE, ROI, calibración)
+   4. Registrar resultado post-partido
+   5. Ver resumen de predicciones recientes
 """
 
 import logging
@@ -23,9 +24,15 @@ from sofascore_client import enriquecer_datos_partido, verificar_salud_sofascore
 from flashscore_client import enriquecer_datos_partido as enriquecer_flashscore
 from betsafe_client import obtener_cuotas_betsafe_desde_url
 from analyzer import analizar_partido
+import prediction_db as db
+from quant_model import run_full_projection
+from bankroll import get_stats_summary as get_bankroll_summary
 
 logging.basicConfig(level=logging.INFO, format="  [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# Inicializar DB al arrancar
+db.init_db()
 
 
 def _separador():
@@ -74,27 +81,24 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
     print(f"\n  Obteniendo datos de: {local} vs {visitante}...")
 
     if es_sofascore_only:
-        # Liga solo en SofaScore, sin BSD
         try:
             datos_resumidos = obtener_datos_completos_sofascore(partido)
         except Exception as e:
-            print(f"  \u2717 Error al obtener datos de SofaScore: {e}")
+            print(f"  ✗ Error al obtener datos de SofaScore: {e}")
             return None, None
 
         ss = datos_resumidos.get("_sofascore", {})
         if not ss.get("disponible"):
-            print(f"  \u2717 SofaScore no disponible: {ss.get('error', '?')}")
+            print(f"  ✗ SofaScore no disponible: {ss.get('error', '?')}")
             return None, None
 
-        print("  \u2713 SofaScore (datos completos)")
+        print("  ✓ SofaScore (datos completos)")
 
-        # Flashscore enrichment
         try:
             datos_resumidos = enriquecer_flashscore(datos_resumidos)
         except Exception:
             pass
 
-        # No hay prediccion BSD, construir una vacia
         prediccion_resumida = {}
 
         if verbose:
@@ -114,37 +118,34 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
     # ── Flujo BSD + SofaScore (normal) ──
     try:
         detalle = obtener_detalle_partido(match_id)
-        print("  \u2713 Datos BSD del partido obtenidos")
+        print("  ✓ Datos BSD del partido obtenidos")
     except Exception as e:
-        print(f"  \u2717 Error al obtener detalle del partido: {e}")
+        print(f"  ✗ Error al obtener detalle del partido: {e}")
         return None, None
 
-    # 2. Obtener predicciones ML (BSD)
     try:
         predicciones = obtener_predicciones(match_id=match_id)
         if predicciones:
             prediccion = predicciones[0]
-            print("  \u2713 Predicción ML (CatBoost) obtenida")
+            print("  ✓ Predicción ML (CatBoost) obtenida")
         else:
             league_id = partido.get("league", {}).get("id")
             predicciones = obtener_predicciones(league_id=league_id)
             prediccion = predicciones[0] if predicciones else {}
             if prediccion:
-                print("  \u2713 Predicción ML obtenida (por liga)")
+                print("  ✓ Predicción ML obtenida (por liga)")
             else:
-                print("  \u26a0 No se encontraron predicciones ML para este partido")
+                print("  ⚠ No se encontraron predicciones ML para este partido")
                 prediccion = {}
     except Exception as e:
-        print(f"  \u26a0 Error al obtener predicciones: {e}")
+        print(f"  ⚠ Error al obtener predicciones: {e}")
         prediccion = {}
 
-    # 3. Resumir datos
     datos_resumidos = resumir_datos_partido(detalle)
     datos_resumidos["partido"] = f"{detalle.get('home_team', local)} vs {detalle.get('away_team', visitante)}"
 
     prediccion_resumida = resumir_prediccion(prediccion)
 
-    # 3.5. Enriquecer con BSD v2 (managers, referee, stats, metadata, player-stats, standings, squads)
     try:
         datos_resumidos = enriquecer_con_v2(datos_resumidos, match_id)
         v2 = datos_resumidos.get("_bsd_v2", {})
@@ -158,16 +159,14 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
         if v2.get("standings") and "_error" not in v2["standings"]:
             v2_parts.append("standings (xG)")
         if v2_parts:
-            print(f"  \u2713 BSD v2: {', '.join(v2_parts)}")
-        # Actualizar prediccion si v2 devolvio una
+            print(f"  ✓ BSD v2: {', '.join(v2_parts)}")
         prediccion_v2 = datos_resumidos.pop("_v2_prediction_raw", {})
         if prediccion_v2 and not prediccion_resumida:
             prediccion_resumida = resumir_prediccion(prediccion_v2)
-            print("  \u2713 Prediccion ML via BSD v2")
+            print("  ✓ Prediccion ML via BSD v2")
     except Exception as e:
-        print(f"  \u26a0 BSD v2 enrichment: {e}")
+        print(f"  ⚠ BSD v2 enrichment: {e}")
 
-    # 4. Enriquecer con SofaScore (alineaciones, arbitro, managers, lesiones, H2H, form)
     try:
         datos_resumidos = enriquecer_datos_partido(datos_resumidos)
         if datos_resumidos.get("_sofascore", {}).get("disponible"):
@@ -181,13 +180,10 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
                 partes.append("arbitro + managers + lesiones")
             if ss_info.get("form_performance"):
                 partes.append("form (performance)")
-            print(f"  \u2713 SofaScore: {', '.join(partes) if partes else 'encontrado (sin alineaciones aun)'}")
-        else:
-            pass
+            print(f"  ✓ SofaScore: {', '.join(partes) if partes else 'encontrado (sin alineaciones aun)'}")
     except Exception as e:
-        print(f"  \u26a0 SofaScore no disponible: {e}")
+        print(f"  ⚠ SofaScore no disponible: {e}")
 
-    # 5. Enriquecer con Flashscore (tarjetas/arbitros)
     try:
         datos_resumidos = enriquecer_flashscore(datos_resumidos)
         if datos_resumidos.get("_flashscore", {}).get("disponible"):
@@ -198,11 +194,10 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
             if fs.get("equipo_stats"):
                 partes.append("tendencias equipos")
             if partes:
-                print(f"  \u2713 Flashscore: {', '.join(partes)}")
+                print(f"  ✓ Flashscore: {', '.join(partes)}")
     except Exception:
         pass
 
-    # 5.5. Arbitro (WhoScored / Transfermarkt / SofaScore - el usuario pega la URL)
     try:
         print(f"     Pega URL del arbitro (WhoScored/Transfermarkt/SofaScore) o Enter para omitir:")
         url_arb = input("     > ").strip()
@@ -212,23 +207,22 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
                 datos_resumidos = enriquecer_arbitro_whoscored(datos_resumidos, url_arb)
                 ws = (datos_resumidos.get("arbitro") or {}).get("_whoscored", {})
                 if ws:
-                    print(f"     \u2713 WhoScored: {ws.get('yc_pp', '?')} YC/part, {ws.get('total_partidos', '?')} partidos")
+                    print(f"     ✓ WhoScored: {ws.get('yc_pp', '?')} YC/part, {ws.get('total_partidos', '?')} partidos")
             elif "transfermarkt" in url_arb:
                 from transfermarkt_client import enriquecer_arbitro_transfermarkt
                 datos_resumidos = enriquecer_arbitro_transfermarkt(datos_resumidos, url_arb)
                 tm = (datos_resumidos.get("arbitro") or {}).get("_transfermarkt", {})
                 if tm:
-                    print(f"     \u2713 Transfermarkt: {tm.get('yc_pp', '?')} YC/part, {tm.get('total_partidos', '?')} partidos")
+                    print(f"     ✓ Transfermarkt: {tm.get('yc_pp', '?')} YC/part, {tm.get('total_partidos', '?')} partidos")
             elif "sofascore.com" in url_arb:
                 from sofascore_client import enriquecer_arbitro_sofascore
                 datos_resumidos = enriquecer_arbitro_sofascore(datos_resumidos, url_arb)
                 sf = (datos_resumidos.get("arbitro") or {}).get("_sofascore_ref", {})
                 if sf:
-                    print(f"     \u2713 SofaScore: {sf.get('yc_pp', '?')} YC/part, {sf.get('total_partidos', '?')} partidos")
+                    print(f"     ✓ SofaScore: {sf.get('yc_pp', '?')} YC/part, {sf.get('total_partidos', '?')} partidos")
     except Exception:
         pass
 
-    # 6. Obtener cuotas Betsafe (manual)
     try:
         print(f"     Pega la URL de Betsafe (Enter para omitir):")
         url = input("     > ").strip()
@@ -236,9 +230,9 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
             cuotas = obtener_cuotas_betsafe_desde_url(url)
             if cuotas and "error" not in cuotas and cuotas.get("markets"):
                 datos_resumidos["_cuotas"] = cuotas
-                print(f"     \u2713 Betsafe: {len(cuotas.get('markets', {}))} mercados en tiempo real")
+                print(f"     ✓ Betsafe: {len(cuotas.get('markets', {}))} mercados en tiempo real")
             else:
-                print(f"     \u2717 Error: {cuotas.get('error', '?')}")
+                print(f"     ✗ Error: {cuotas.get('error', '?')}")
     except Exception:
         pass
 
@@ -248,11 +242,66 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
     return datos_resumidos, prediccion_resumida
 
 
+def _menu_performance():
+    _separador()
+    print("  ESTADÍSTICAS DE PERFORMANCE (últimos 30 días)")
+    summary = db.get_stats_summary(days=30)
+    print(f"    Predicciones registradas: {summary['predictions']}")
+    print(f"    Resultados reales cargados: {summary['results']}")
+    print(f"    Apuestas realizadas: {summary['bets']}")
+    if summary['roi_pct'] is not None:
+        print(f"    P/L: {summary['profit']:.2f} | ROI: {summary['roi_pct']:.2f}%")
+    else:
+        print(f"    P/L: {summary['profit']:.2f} | ROI: N/D (sin stakes)")
+
+    print("\n  MAE por métrica (últimos 90 días):")
+    mae_rows = db.get_mae_by_metric(days=90)
+    if not mae_rows:
+        print("    (Sin datos suficientes aún. Registra resultados con post_match.py)")
+    for row in mae_rows:
+        print(f"    {row['metric']}: MAE={row['mae']:.2f} (n={row['n']})")
+
+    print("\n  ROI por mercado (últimos 90 días):")
+    roi_rows = db.get_roi(days=90)
+    if not roi_rows:
+        print("    (Sin apuestas evaluadas)")
+    for row in roi_rows:
+        print(f"    {row['mercado']}: ROI={row['roi_pct']:.2f}% | Profit={row['total_profit']:.2f} | Bets={row['total_bets']}")
+
+    print("\n  Calibración de probabilidades (últimos 90 días):")
+    cal = db.get_calibration(days=90)
+    if not cal:
+        print("    (Sin datos suficientes)")
+    for c in cal:
+        print(f"    {c['metric']} bin={c['bin']}: pred={c['avg_prediction']} vs real={c['actual_rate']} | error={c['calibration_error']} (n={c['n']})")
+
+    input("\n  Presiona Enter para volver...")
+
+
+def _menu_predicciones_recientes():
+    _separador()
+    preds = db.get_recent_predictions(limit=20, days=30)
+    if not preds:
+        print("  No hay predicciones recientes en la base de datos.")
+        input("\n  Presiona Enter para volver...")
+        return
+
+    print(f"  Últimas predicciones (mostrando {len(preds)}):\n")
+    for p in preds:
+        resultado = ""
+        if p.get("score_local") is not None:
+            resultado = f" | Resultado: {p['score_local']}-{p['score_visitor']}"
+        print(f"  {p['match_name']} ({p['league']}) [{p['match_date'][:10]}]{resultado}")
+        print(f"     Quant: G={p['proj_total_goals']} T={p['proj_tiros_total']} C={p['proj_corners_total']} YC={p['proj_yc_total']}")
+
+    input("\n  Presiona Enter para volver...")
+
+
 def main():
-    print("\n" + "\u2554" + "\u2550" * 48 + "\u2557")
-    print("\u2551" + "     \U0001F3AF BETTING AI - Value Betting Analyzer     ".center(48) + "\u2551")
-    print("\u2551" + "     Análisis de apuestas con valor esperado    ".center(48) + "\u2551")
-    print("\u255a" + "\u2550" * 48 + "\u255d")
+    print("\n" + "╔" + "═" * 48 + "╗")
+    print("║" + "     🎯 BETTING AI - Value Betting Analyzer v2     ".center(48) + "║")
+    print("║" + "     Cuantitativo + LLM + Feedback Loop           ".center(48) + "║")
+    print("╚" + "═" * 48 + "╝")
 
     partidos_cache = []
 
@@ -266,13 +315,14 @@ def main():
             print(f"  3. Actualizar lista de partidos ({len(partidos_cache)} en caché)")
         else:
             print("  3. Salir")
-        print("  0. Salir" if partidos_cache else "")
+        print("  4. Ver performance del sistema (MAE / ROI / Calibración)")
+        print("  5. Ver predicciones recientes")
+        print("  0. Salir")
 
         opcion = input("\n  Opción: ").strip()
 
         if opcion == "1":
-            print("\n  Cargando próximos partidos de ligas europeas, torneos internacionales y sudamericanos...")
-            print("  (Brasileirao, Premier League, La Liga, Bundesliga + UCL, Libertadores, Sudamericana + Liga 1 Peru)")
+            print("\n  Cargando próximos partidos...")
             try:
                 verificar_salud_sofascore(detallado=True)
                 partidos_cache = obtener_proximos_partidos()
@@ -281,7 +331,7 @@ def main():
                 partidos_cache.sort(key=lambda p: p.get("event_date", "") if isinstance(p.get("event_date"), str) else "")
                 _mostrar_partidos(partidos_cache)
             except Exception as e:
-                print(f"\n  \u2717 Error al obtener partidos: {e}")
+                print(f"\n  ✗ Error al obtener partidos: {e}")
                 print("  Verifica que BSD_API_KEY esté configurada en el archivo .env")
 
         elif opcion == "2":
@@ -303,28 +353,29 @@ def main():
                 print("\n  No se pudieron obtener los datos suficientes para el análisis.")
                 continue
 
-            # Si se pasa --show-prompt, muestra el prompt en vez de llamar a DeepSeek
             if "--show-prompt" in sys.argv:
                 _separador()
                 from analyzer import SYSTEM_PROMPT, _crear_prompt_usuario
-                user_prompt = _crear_prompt_usuario(datos, prediccion)
+                from quant_model import run_full_projection
+                qp, _ = run_full_projection(datos, prediccion)
+                user_prompt = _crear_prompt_usuario(datos, prediccion, qp)
                 print(f"=== SYSTEM PROMPT ({len(SYSTEM_PROMPT)} chars) ===")
                 print(SYSTEM_PROMPT)
                 print(f"\n=== USER PROMPT ({len(user_prompt)} chars) ===")
                 print(user_prompt)
-                print(f"\n=== TOTAL: {len(SYSTEM_PROMPT) + len(user_prompt)} chars enviados a DeepSeek ===")
+                print(f"\n=== TOTAL: {len(SYSTEM_PROMPT) + len(user_prompt)} chars ===")
                 _separador()
-                input("\n  Presioná Enter para continuar...")
+                input("\n  Presiona Enter para continuar...")
                 continue
 
-            print("\n  Consultando a DeepSeek para análisis de value betting...")
+            print("\n  Consultando modelo cuantitativo + DeepSeek...")
             try:
                 analisis = analizar_partido(datos, prediccion)
                 _separador()
                 print(analisis)
                 _separador()
             except Exception as e:
-                print(f"\n  \u2717 Error al analizar con IA: {e}")
+                print(f"\n  ✗ Error al analizar: {e}")
                 print("  Verifica que OPENROUTER_API_KEY esté configurada en el archivo .env")
 
         elif opcion == "3":
@@ -334,10 +385,16 @@ def main():
                     partidos_cache = obtener_proximos_partidos()
                     _mostrar_partidos(partidos_cache)
                 except Exception as e:
-                    print(f"\n  \u2717 Error al actualizar: {e}")
+                    print(f"\n  ✗ Error al actualizar: {e}")
             else:
                 print("\n  ¡Hasta luego!")
                 sys.exit(0)
+
+        elif opcion == "4":
+            _menu_performance()
+
+        elif opcion == "5":
+            _menu_predicciones_recientes()
 
         elif opcion == "0":
             print("\n  ¡Hasta luego!")
