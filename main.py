@@ -21,7 +21,6 @@ from bsd_client import (
 )
 from bsd_client_v2 import enriquecer_con_v2
 from sofascore_client import enriquecer_datos_partido, verificar_salud_sofascore, obtener_partidos_sofascore_only, obtener_datos_completos_sofascore
-from flashscore_client import enriquecer_datos_partido as enriquecer_flashscore
 from betsafe_client import obtener_cuotas_betsafe_desde_url
 from analyzer import analizar_partido
 import prediction_db as db
@@ -183,45 +182,6 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
             print(f"  ✓ SofaScore: {', '.join(partes) if partes else 'encontrado (sin alineaciones aun)'}")
     except Exception as e:
         print(f"  ⚠ SofaScore no disponible: {e}")
-
-    try:
-        datos_resumidos = enriquecer_flashscore(datos_resumidos)
-        if datos_resumidos.get("_flashscore", {}).get("disponible"):
-            fs = datos_resumidos["_flashscore"]
-            partes = []
-            if fs.get("arbitro_stats"):
-                partes.append(f"arbitro ({fs['arbitro_stats'].get('promedio', '?')} YC/partido)")
-            if fs.get("equipo_stats"):
-                partes.append("tendencias equipos")
-            if partes:
-                print(f"  ✓ Flashscore: {', '.join(partes)}")
-    except Exception:
-        pass
-
-    try:
-        print(f"     Pega URL del arbitro (WhoScored/Transfermarkt/SofaScore) o Enter para omitir:")
-        url_arb = input("     > ").strip()
-        if url_arb:
-            if "whoscored.com" in url_arb:
-                from whoscored_client import enriquecer_arbitro_whoscored
-                datos_resumidos = enriquecer_arbitro_whoscored(datos_resumidos, url_arb)
-                ws = (datos_resumidos.get("arbitro") or {}).get("_whoscored", {})
-                if ws:
-                    print(f"     ✓ WhoScored: {ws.get('yc_pp', '?')} YC/part, {ws.get('total_partidos', '?')} partidos")
-            elif "transfermarkt" in url_arb:
-                from transfermarkt_client import enriquecer_arbitro_transfermarkt
-                datos_resumidos = enriquecer_arbitro_transfermarkt(datos_resumidos, url_arb)
-                tm = (datos_resumidos.get("arbitro") or {}).get("_transfermarkt", {})
-                if tm:
-                    print(f"     ✓ Transfermarkt: {tm.get('yc_pp', '?')} YC/part, {tm.get('total_partidos', '?')} partidos")
-            elif "sofascore.com" in url_arb:
-                from sofascore_client import enriquecer_arbitro_sofascore
-                datos_resumidos = enriquecer_arbitro_sofascore(datos_resumidos, url_arb)
-                sf = (datos_resumidos.get("arbitro") or {}).get("_sofascore_ref", {})
-                if sf:
-                    print(f"     ✓ SofaScore: {sf.get('yc_pp', '?')} YC/part, {sf.get('total_partidos', '?')} partidos")
-    except Exception:
-        pass
 
     try:
         print(f"     Pega la URL de Betsafe (Enter para omitir):")

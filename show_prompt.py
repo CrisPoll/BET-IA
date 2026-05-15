@@ -63,7 +63,6 @@ def _cargar_datos_partido(partido: dict):
         resumir_prediccion,
     )
     from sofascore_client import enriquecer_datos_partido, obtener_datos_completos_sofascore
-    from flashscore_client import enriquecer_datos_partido as enriquecer_flashscore
     from betsafe_client import obtener_cuotas_betsafe_desde_url
 
     match_id = partido.get("id")
@@ -86,11 +85,6 @@ def _cargar_datos_partido(partido: dict):
             return None, None
 
         print("  [OK] SofaScore (datos completos)")
-
-        try:
-            datos_resumidos = enriquecer_flashscore(datos_resumidos)
-        except Exception:
-            pass
 
         prediccion_resumida = {}
         return datos_resumidos, prediccion_resumida
@@ -152,13 +146,6 @@ def _cargar_datos_partido(partido: dict):
         print(f"  [WARN] SofaScore: {e}")
 
     try:
-        datos_resumidos = enriquecer_flashscore(datos_resumidos)
-        if datos_resumidos.get("_flashscore", {}).get("disponible"):
-            print("  [OK] Flashscore")
-    except Exception:
-        pass
-
-    try:
         print("  Pegá la URL de Betsafe o el eventId (Enter para omitir):")
         url = input("  > ").strip()
         if url:
@@ -171,46 +158,16 @@ def _cargar_datos_partido(partido: dict):
     except Exception:
         pass
 
-    # Arbitro (WhoScored / Transfermarkt / SofaScore)
-    try:
-        print("  Pega URL del arbitro (WhoScored/Transfermarkt/SofaScore) o Enter para omitir:")
-        url_arb = input("  > ").strip()
-        if url_arb:
-            if "whoscored.com" in url_arb:
-                from whoscored_client import enriquecer_arbitro_whoscored
-                datos_resumidos = enriquecer_arbitro_whoscored(datos_resumidos, url_arb)
-                ws = (datos_resumidos.get("arbitro") or {}).get("_whoscored", {})
-                if ws:
-                    print(f"  [OK] WhoScored: {ws.get('yc_pp', '?')} YC/part, {ws.get('total_partidos', '?')} partidos")
-                else:
-                    print("  [WARN] WhoScored no devolvio datos")
-            elif "transfermarkt" in url_arb:
-                from transfermarkt_client import enriquecer_arbitro_transfermarkt
-                datos_resumidos = enriquecer_arbitro_transfermarkt(datos_resumidos, url_arb)
-                tm = (datos_resumidos.get("arbitro") or {}).get("_transfermarkt", {})
-                if tm:
-                    print(f"  [OK] Transfermarkt: {tm.get('yc_pp', '?')} YC/part, {tm.get('total_partidos', '?')} partidos")
-                else:
-                    print("  [WARN] Transfermarkt no devolvio datos")
-            elif "sofascore.com" in url_arb:
-                from sofascore_client import enriquecer_arbitro_sofascore
-                datos_resumidos = enriquecer_arbitro_sofascore(datos_resumidos, url_arb)
-                sf = (datos_resumidos.get("arbitro") or {}).get("_sofascore_ref", {})
-                if sf:
-                    print(f"  [OK] SofaScore: {sf.get('yc_pp', '?')} YC/part, {sf.get('total_partidos', '?')} partidos")
-                else:
-                    print("  [WARN] SofaScore no devolvio datos")
-    except Exception as e:
-        print(f"  [WARN] Arbitro: {e}")
-
     return datos_resumidos, prediccion_resumida
 
 
 def show_prompt(datos, prediccion, save_to=None):
     """
-    Construye y muestra el prompt completo que se enviaría a DeepSeek.
+    Construye y muestra el prompt completo que se enviaria a DeepSeek.
     """
-    user_prompt = _crear_prompt_usuario(datos, prediccion)
+    from quant_model import run_full_projection
+    quant_projections, _ = run_full_projection(datos, prediccion)
+    user_prompt = _crear_prompt_usuario(datos, prediccion, quant_projections)
     total_chars = len(SYSTEM_PROMPT) + len(user_prompt)
     total_tokens_approx = total_chars // 4
 

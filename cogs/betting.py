@@ -13,7 +13,6 @@ from bsd_client import (
 )
 from bsd_client_v2 import enriquecer_con_v2
 from sofascore_client import enriquecer_datos_partido as enriquecer_sofascore, verificar_salud_sofascore, obtener_partidos_sofascore_only, obtener_datos_completos_sofascore
-from flashscore_client import enriquecer_datos_partido as enriquecer_flashscore
 from betsafe_client import obtener_cuotas_betsafe_desde_url
 from analyzer import analizar_partido
 
@@ -274,10 +273,6 @@ class BettingCog(commands.Cog):
                     datos_resumidos = enriquecer_sofascore(datos_resumidos)
                 except Exception:
                     pass
-                try:
-                    datos_resumidos = enriquecer_flashscore(datos_resumidos)
-                except Exception:
-                    pass
 
             # Betsafe
             if betsafe_url:
@@ -289,17 +284,11 @@ class BettingCog(commands.Cog):
                 except Exception:
                     pass
 
-            # Arbitro WhoScored / Transfermarkt / SofaScore
+            # Arbitro SofaScore
             if arbitro_url:
                 await _update("Scrapeando datos del arbitro...")
                 try:
-                    if "whoscored" in arbitro_url:
-                        from whoscored_client import enriquecer_arbitro_whoscored
-                        datos_resumidos = await asyncio.to_thread(enriquecer_arbitro_whoscored, datos_resumidos, arbitro_url)
-                    elif "transfermarkt" in arbitro_url:
-                        from transfermarkt_client import enriquecer_arbitro_transfermarkt
-                        datos_resumidos = await asyncio.to_thread(enriquecer_arbitro_transfermarkt, datos_resumidos, arbitro_url)
-                    elif "sofascore.com" in arbitro_url:
+                    if "sofascore.com" in arbitro_url:
                         from sofascore_client import enriquecer_arbitro_sofascore
                         datos_resumidos = enriquecer_arbitro_sofascore(datos_resumidos, arbitro_url)
                 except Exception:

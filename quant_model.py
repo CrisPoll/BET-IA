@@ -9,6 +9,7 @@ La idea: dar una base numérica sólida antes de que el LLM aplique
 ajustes cualitativos.
 """
 
+import json
 import math
 from typing import Dict, Optional, List
 
@@ -104,8 +105,12 @@ def build_features(datos_resumidos: dict, prediccion_resumida: dict) -> dict:
     v2 = datos_resumidos.get("_bsd_v2", {})
     if v2:
         stats = v2.get("stats", {})
-        features["xg_per_min_home"] = stats.get("xg_per_minute", {}).get("home")
-        features["xg_per_min_away"] = stats.get("xg_per_minute", {}).get("away")
+        if stats and "_error" not in stats:
+            per_team = stats.get("stats", {})
+            home_st = per_team.get("home", {})
+            away_st = per_team.get("away", {})
+            features["xg_per_min_home"] = (home_st.get("xg") or {}).get("actual")
+            features["xg_per_min_away"] = (away_st.get("xg") or {}).get("actual")
 
     v2_detail = datos_resumidos.get("_v2_detail", {})
     features["is_derby"] = 1 if v2_detail.get("is_local_derby") else 0

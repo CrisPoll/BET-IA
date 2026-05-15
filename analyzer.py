@@ -23,10 +23,6 @@ from sofascore_client import (
     _formatear_match_statistics_para_prompt,
     _formatear_team_season_stats_para_prompt,
 )
-from flashscore_client import (
-    _formatear_flashscore_para_prompt,
-    _formatear_standings_flashscore_para_prompt,
-)
 from betsafe_client import _formatear_cuotas_betsafe_para_prompt
 from bsd_client_v2 import (
     resumir_stats_v2_para_prompt,
@@ -34,11 +30,12 @@ from bsd_client_v2 import (
     resumir_player_stats_v2_para_prompt,
     resumir_standings_v2_para_prompt,
     resumir_squads_v2_para_prompt,
+    resumir_manager_v2_para_prompt,
+    resumir_arbitro_v2_para_prompt,
 )
 
 # Nuevos módulos
 from quant_model import run_full_projection
-from agents_pipeline import run_pipeline
 import prediction_db as db
 from bankroll import (
     evaluate_stat_market,
@@ -56,9 +53,6 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 MODEL_NAME = "deepseek/deepseek-v4-pro"
 MAX_TOKENS = 100000
 TEMPERATURE = 0.3
-
-# Feature flag: usar pipeline de agentes en lugar de prompt monolítico
-USE_AGENT_PIPELINE = os.getenv("USE_AGENT_PIPELINE", "true").lower() == "true"
 
 # ═══════════════════════════════════════════════════════════════
 # SYSTEM PROMPT MEJORADO CON FEW-SHOT Y AWARENESS DEL MODELO CUANTITATIVO
@@ -382,9 +376,8 @@ PRIORIDAD: Proyecta estadísticas del partido (tiros, goles por mitad, amarillas
 {_format_standings_section(datos_resumidos)}
 IMPORTANTE: Usa la tabla para determinar CUANTOS PARTIDOS QUEDAN (total equipos - 1 = partidos en la temporada, resta los PJ de cada equipo). Si un equipo ya completó su cupo o le quedan pocos partidos, eso define la urgencia y motivación.
 
-### ESTILOS DE ENTRENADORES
-- Local: {json.dumps(datos_resumidos.get('entrenador_local', {}), indent=2, ensure_ascii=False)}
-- Visitante: {json.dumps(datos_resumidos.get('entrenador_visitante', {}), indent=2, ensure_ascii=False)}
+### ESTILOS DE ENTRENADORES (BSD v2)
+{resumir_manager_v2_para_prompt(datos_resumidos)}
 
 ### HEAD TO HEAD (últimos 3 años)
 - NOTA: Solo se muestran enfrentamientos recientes. El H2H antiguo (>3 años) fue excluido.
@@ -424,7 +417,6 @@ IMPORTANTE: Usa la tabla para determinar CUANTOS PARTIDOS QUEDAN (total equipos 
     {_formatear_incidents_para_prompt(datos_resumidos)}
     {_formatear_match_statistics_para_prompt(datos_resumidos)}
     {_formatear_team_season_stats_para_prompt(datos_resumidos)}
-    {_formatear_flashscore_para_prompt(datos_resumidos)}
 
 ---
 ## DATOS ADICIONALES BSD v2
@@ -440,7 +432,6 @@ def _format_standings_section(datos_resumidos: dict) -> str:
     """Muestra standings de todas las fuentes."""
     partes = [
         _formatear_standings_para_prompt(datos_resumidos),
-        _formatear_standings_flashscore_para_prompt(datos_resumidos),
         _v2_standings_section(datos_resumidos),
     ]
     content = "\n".join(p for p in partes if p.strip())
@@ -485,6 +476,7 @@ def _v2_sections(datos_resumidos: dict) -> str:
     partes.append(resumir_player_stats_v2_para_prompt(v2))
     partes.append(resumir_metadata_v2_para_prompt(v2))
     partes.append(resumir_squads_v2_para_prompt(v2))
+    partes.append(resumir_arbitro_v2_para_prompt(datos_resumidos))
 
     return "\n".join(p for p in partes if p.strip())
 
@@ -539,29 +531,17 @@ def analizar_partido(datos_resumidos: dict, prediccion_resumida: dict) -> str:
           f"Tiros: {quant_projections.get('tiros_total')} | Corners: {quant_projections.get('corners_total')} | "
           f"YC: {quant_projections.get('yc_total')}")
 
-    # 3. Elegir modo de análisis LLM
-    if USE_AGENT_PIPELINE:
-        print("  [Analyzer] Usando pipeline de agentes (3 pasos)...")
-        from agents_pipeline import run_pipeline, format_full_output
-        ctx, proj, val = run_pipeline(datos_resumidos, prediccion_resumida, quant_projections, {
-            "btts_yes": quant_projections.get("btts_yes"),
-            "over25_yes": quant_projections.get("over25_yes"),
-        })
-        analysis_text = format_full_output(ctx, proj, val)
+    # 3. Análisis LLM (monolítico, 1 llamada)
+    print("  [Analyzer] Llamando a DeepSeek...")
+    client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY)
+    prompt_usuario = _crear_prompt_usuario(datos_resumidos, prediccion_resumida, quant_projections)
 
-        # Extraer proyecciones del LLM del texto para guardar en DB (simplificado)
-        llm_projections = _extract_llm_projections(proj + "\n" + val)
-    else:
-        print("  [Analyzer] Usando prompt monolítico mejorado...")
-        client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY)
-        prompt_usuario = _crear_prompt_usuario(datos_resumidos, prediccion_resumida, quant_projections)
-
-        contenido, razonamiento, finish_reason = _call_deepseek(client, prompt_usuario, include_reasoning=True)
-        if contenido is None:
-            print("  [DeepSeek] Agotó tokens en reasoning, reintentando sin reasoning...")
-            contenido, razonamiento, finish_reason = _call_deepseek(client, prompt_usuario, include_reasoning=False)
-        if contenido is None:
-            raise RuntimeError("El modelo no devolvió contenido visible.")
+    contenido, razonamiento, finish_reason = _call_deepseek(client, prompt_usuario, include_reasoning=True)
+    if contenido is None:
+        print("  [DeepSeek] Agotó tokens en reasoning, reintentando sin reasoning...")
+        contenido, razonamiento, finish_reason = _call_deepseek(client, prompt_usuario, include_reasoning=False)
+    if contenido is None:
+        raise RuntimeError("El modelo no devolvió contenido visible.")
         if finish_reason == "length":
             print(f"  [ADVERTENCIA] Respuesta truncada. Considera aumentar MAX_TOKENS.")
         if razonamiento:
