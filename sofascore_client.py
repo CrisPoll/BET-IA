@@ -831,6 +831,11 @@ def _extraer_info_evento_detalle(evento_detalle: dict) -> dict:
         resultado["arbitro"] = {
             "nombre": referee.get("name"),
             "nacionalidad": referee.get("slug", "").replace("-", " ").title() if referee.get("slug") else "",
+            "id": referee.get("id"),
+            "total_partidos": referee.get("games"),
+            "yc_total": referee.get("yellowCards"),
+            "rc_total": referee.get("redCards"),
+            "ycrc_total": referee.get("yellowRedCards"),
         }
 
     home_manager = evento_detalle.get("homeTeam", {}).get("manager", {})
@@ -1057,6 +1062,39 @@ def enriquecer_datos_partido(datos_bsd: dict) -> dict:
                         enriquecido[f"{pkey}_stats_per_match"] = stats_per_match
                 except Exception:
                     pass
+
+    # Enriquecer arbitro desde API de SofaScore (stats por torneo)
+    detalle_ev = enriquecido.get("detalle_evento", {})
+    arb_ss = detalle_ev.get("arbitro", {}) if isinstance(detalle_ev, dict) else {}
+    arb_id = arb_ss.get("id")
+    if arb_id:
+        try:
+            arb_stats = obtener_datos_arbitro_sofascore(session, arb_id)
+            if arb_stats:
+                enriquecido["arbitro"] = arb_stats
+                # Merge en datos_bsd para que el analyzer lo use
+                existing = datos_bsd.get("arbitro") or {}
+                torneo_actual = enriquecido.get("torneo", "")
+                ss_yc = arb_stats.get("yc_pp")
+                ss_rc = arb_stats.get("rc_pp")
+                # Buscar YC/part especifica del torneo actual
+                for t in arb_stats.get("torneos", []):
+                    if t.get("nombre") == torneo_actual:
+                        ss_yc = t.get("yc_pp", ss_yc)
+                        ss_rc = t.get("rc_pp", ss_rc)
+                        break
+                datos_bsd["arbitro"] = {
+                    **existing,
+                    "nombre": arb_stats.get("nombre") or existing.get("nombre"),
+                    "nacionalidad": arb_stats.get("pais") or existing.get("nacionalidad"),
+                    "avg_yellow_per_match": ss_yc or existing.get("avg_yellow_per_match"),
+                    "avg_red_per_match": ss_rc or existing.get("avg_red_per_match"),
+                    "total_yellow_cards": arb_stats.get("yc_total") or existing.get("total_yellow_cards"),
+                    "total_red_cards": arb_stats.get("rc_total") or existing.get("total_red_cards"),
+                    "_fuente_yc": "SofaScore",
+                }
+        except Exception:
+            pass
 
     datos_bsd["_sofascore"] = enriquecido
     return datos_bsd

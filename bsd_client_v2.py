@@ -351,9 +351,13 @@ def enriquecer_con_v2(datos_resumidos: dict, match_id: int) -> dict:
             datos_resumidos[coach_key] = existing
 
     # 4. Enriquecer arbitro con datos detallados de referee
+    # SofaScore tiene prioridad en YC/RC (datos por torneo, mas completos que BSD)
     referee = v2_data.get("referee", {})
     if referee and "_error" not in referee:
         existing_arb = datos_resumidos.get("arbitro") or {}
+        # Preservar YC/RC de SofaScore si ya existen
+        ss_yc = existing_arb.get("avg_yellow_per_match") if existing_arb.get("_fuente_yc") == "SofaScore" else referee.get("avg_yellow_per_match")
+        ss_rc = existing_arb.get("avg_red_per_match") if existing_arb.get("_fuente_yc") == "SofaScore" else referee.get("avg_red_per_match")
         datos_resumidos["arbitro"] = {
             **existing_arb,
             "id": referee.get("id") or existing_arb.get("id"),
@@ -361,8 +365,8 @@ def enriquecer_con_v2(datos_resumidos: dict, match_id: int) -> dict:
             "nacionalidad": referee.get("country") or existing_arb.get("nacionalidad"),
             "total_yellow_cards": referee.get("total_yellow_cards"),
             "total_red_cards": referee.get("total_red_cards"),
-            "avg_yellow_per_match": referee.get("avg_yellow_per_match"),
-            "avg_red_per_match": referee.get("avg_red_per_match"),
+            "avg_yellow_per_match": ss_yc,
+            "avg_red_per_match": ss_rc,
             "avg_goals_per_match": referee.get("avg_goals_per_match"),
             "avg_fouls_per_match": referee.get("avg_fouls_per_match"),
         }
