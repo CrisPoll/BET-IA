@@ -99,12 +99,14 @@ PASO 1 - CONTEXTO DEL PARTIDO (LO MÁS IMPORTANTE):
 Antes de proyectar cualquier estadística, analiza el contexto. Sin contexto, los números no valen nada.
 
 a) ¿QUÉ SE JUEGA? (MOTIVACIÓN):
-   - Mira la tabla de posiciones. ¿Cuántos partidos quedan en la temporada? (total equipos - 1 - PJ jugados)
+   - ATENCION: La Ronda/Fase en BSD v2 indica si es final, semifinal, grupos o liga. Si es FINAL: partido unico, no hay tabla, motivacion maxima.
+   - Mira la tabla de posiciones (si aplica). ¿Cuántos partidos quedan en la temporada? (total equipos - 1 - PJ jugados)
    - ¿Equipo peleando título, clasificación a copa, descenso, o sin nada en juego?
    - ¿Es eliminatoria (ida/vuelta)? ¿El resultado de ida condiciona el planteamiento?
    - Equipos sin nada que jugar tienden a partidos más abiertos o más apáticos. Evalúa cuál aplica según perfil del DT.
    - Equipos en descenso directo: desesperación = mas faltas, más tarjetas, más tiros apurados.
    - Equipo que con empate clasifica: planteamiento conservador, pocos tiros, muchas faltas tácticas.
+   - Finales en cancha neutral: sin ventaja de localia, presion maxima, inicio tactico, mas tarjetas en 2T.
 
 b) PERFIL DE CADA EQUIPO (ESTILO DE JUEGO):
    - Ofensivo/defensivo: posesión alta/baja, presión alta/baja, transiciones rápidas/lentas.
@@ -429,7 +431,13 @@ Analiza los datos anteriores. PRIORIZA las proyecciones estadísticas (tiros, go
 
 
 def _format_standings_section(datos_resumidos: dict) -> str:
-    """Muestra standings de todas las fuentes."""
+    """Muestra standings. Omite para copas donde la tabla es combinada y confunde."""
+    rn = (datos_resumidos.get("_v2_detail") or {}).get("round_number")
+    liga = datos_resumidos.get("liga", "")
+    if rn and _es_fase_eliminatoria_final(liga, rn):
+        fase = _nombre_fase(liga, rn) if rn else "Copa"
+        return f"({fase} - tabla general no aplica. Mira la Ronda/Fase en CONTEXTO y la forma reciente.)"
+
     partes = [
         _formatear_standings_para_prompt(datos_resumidos),
         _v2_standings_section(datos_resumidos),
@@ -447,8 +455,38 @@ def _v2_standings_section(datos_resumidos: dict) -> str:
     return resumir_standings_v2_para_prompt(v2, home_id, away_id)
 
 
+def _nombre_fase(liga: str, round_number: int) -> str:
+    """Convierte round_number de BSD v2 a etiqueta legible para el LLM."""
+    if "Champions" in liga or "Europa" in liga:
+        fases = {29: "FINAL", 28: "Semifinal", 27: "Cuartos de Final",
+                 25: "Octavos de Final", 17: "Ronda de Playoff",
+                 1: "Fase Liga", 2: "Fase Liga", 3: "Fase Liga",
+                 4: "Fase Liga", 5: "Fase Liga", 6: "Fase Liga",
+                 7: "Fase Liga", 8: "Fase Liga"}
+        return fases.get(round_number, f"Ronda {round_number}")
+    if "Libertadores" in liga or "Sudamericana" in liga:
+        if round_number <= 8:
+            return f"Fase de grupos (fecha {round_number})"
+        if round_number <= 16:
+            return "Octavos de Final"
+        if round_number <= 24:
+            return "Cuartos de Final"
+        if round_number <= 28:
+            return "Semifinal"
+        return "FINAL"
+    return f"Jornada {round_number}"
+
+
+def _es_fase_eliminatoria_final(liga: str, round_number: int) -> bool:
+    """True si es una fase donde la tabla general no aplica.
+    Para copas: la tabla viene combinada (todos los grupos juntos) y confunde al LLM."""
+    copas = ["Champions", "Europa", "Libertadores", "Sudamericana"]
+    if any(c in liga for c in copas):
+        return True  # Toda copa usa formato distinto a liga
+    return False
+
+
 def _v2_sections(datos_resumidos: dict) -> str:
-    """Construye las secciones de datos enriquecidos vía BSD v2."""
     v2 = datos_resumidos.get("_bsd_v2", {})
     if not v2:
         return "(No se obtuvieron datos adicionales de BSD v2)"
@@ -456,7 +494,7 @@ def _v2_sections(datos_resumidos: dict) -> str:
     partes = []
     detail = datos_resumidos.get("_v2_detail", {})
     if detail:
-        has_any = any(detail.get(k) for k in ["is_local_derby", "is_neutral_ground"])
+        has_any = any(detail.get(k) for k in ["is_local_derby", "is_neutral_ground", "round_number"])
         has_any = has_any or detail.get("travel_distance_km") is not None
         has_any = has_any or (detail.get("weather") and detail["weather"].get("description"))
         if has_any:
@@ -465,6 +503,10 @@ def _v2_sections(datos_resumidos: dict) -> str:
                 ln.append("- DERBY LOCAL")
             if detail.get("is_neutral_ground"):
                 ln.append("- Cancha neutral")
+            if detail.get("round_number") is not None:
+                rn = detail["round_number"]
+                fase = _nombre_fase(datos_resumidos.get("liga", ""), rn)
+                ln.append(f"- Ronda/Fase: {fase}")
             if detail.get("travel_distance_km") is not None:
                 ln.append(f"- Distancia de viaje visitante: {detail['travel_distance_km']} km")
             if detail.get("weather") and detail["weather"].get("description"):
