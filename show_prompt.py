@@ -140,7 +140,7 @@ def _cargar_datos_partido(partido: dict):
         datos_resumidos = enriquecer_datos_partido(datos_resumidos)
         ss_info = datos_resumidos.get("_sofascore", {})
         if ss_info.get("disponible"):
-            partes = [k for k in ["alineaciones", "h2h", "detalle_evento", "form_performance"] if ss_info.get(k)]
+            partes = [k for k in ["alineaciones", "h2h", "detalle_evento", "form_performance", "standings"] if ss_info.get(k)]
             print(f"  [OK] SofaScore ({', '.join(partes) if partes else 'basico'})")
     except Exception as e:
         print(f"  [WARN] SofaScore: {e}")

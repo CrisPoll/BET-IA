@@ -178,6 +178,8 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
                 partes.append("arbitro + managers + lesiones")
             if ss_info.get("form_performance"):
                 partes.append("form (performance)")
+            if ss_info.get("standings"):
+                partes.append("standings")
             print(f"  ✓ SofaScore: {', '.join(partes) if partes else 'encontrado (sin alineaciones aun)'}")
     except Exception as e:
         print(f"  ⚠ SofaScore no disponible: {e}")

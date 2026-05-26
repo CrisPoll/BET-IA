@@ -299,6 +299,8 @@ async def _obtener_cuotas_betsafe_async(home_team: str, away_team: str, event_id
                 participants = ev.get("participants", [])
                 h = participants[0].get("label", home_team) if len(participants) > 0 else home_team
                 a = participants[1].get("label", away_team) if len(participants) > 1 else away_team
+                home_team = h or home_team
+                away_team = a or away_team
                 event_name = f"{h} vs {a}"
                 competition_name = ev.get("competitionName", "")
 
@@ -466,6 +468,38 @@ def _format_sel(s):
     return s.get("name") or s.get("label", "?")
 
 
+def _is_team_total_market(name: str, suffix: str, home_team: str = "", away_team: str = "") -> bool:
+    """Detecta mercados tipo 'Lanús - Total de tiros' sin mezclar mitades/jugadores."""
+    normalized = re.sub(r"\s*[–—-]\s*", " - ", (name or "").strip().lower())
+    normalized = re.sub(r"\s*\(\d+(?:[.,]\d+)?\)\s*$", "", normalized)
+    suffix = suffix.lower()
+    marker = f" - {suffix}"
+    if not normalized.endswith(marker):
+        return False
+    if any(token in normalized for token in ["1er tiempo", "primer tiempo", "2º tiempo", "2do tiempo", "jugador", "|"]):
+        return False
+
+    team_part = normalized.rsplit(marker, 1)[0].strip()
+    if not team_part or team_part == "total":
+        return False
+
+    teams = [home_team, away_team]
+    team_norms = [normalizar_nombre(t).lower() for t in teams if t]
+    if team_norms:
+        team_part_norm = normalizar_nombre(team_part).lower()
+        return any(team_part_norm in t or t in team_part_norm for t in team_norms)
+
+    return True
+
+
+def _is_team_total_shots_market(name: str, home_team: str = "", away_team: str = "") -> bool:
+    return _is_team_total_market(name, "total de tiros", home_team, away_team)
+
+
+def _is_team_total_corners_market(name: str, home_team: str = "", away_team: str = "") -> bool:
+    return _is_team_total_market(name, "total de tiros de esquina", home_team, away_team)
+
+
 def _formatear_cuotas_betsafe_para_prompt(result: dict) -> str:
     """Formatea cuotas de Betsafe para el prompt del analyzer - SOLO mercados de valor."""
     if not result or "error" in result:
@@ -477,6 +511,8 @@ def _formatear_cuotas_betsafe_para_prompt(result: dict) -> str:
 
     partes = ["\n### CUOTAS BETSAFE (tiempo real)"]
     comp = result.get("competition", "")
+    home_team = result.get("home_team", "")
+    away_team = result.get("away_team", "")
     if comp:
         partes.append(f"Competicion: {comp}")
     partes.append("")
@@ -516,11 +552,10 @@ def _formatear_cuotas_betsafe_para_prompt(result: dict) -> str:
             r"hándicap asiático \(0 - 1\.5\)$",
         ],
         "Corners": [
-            r"^total de tiros de esquina \(8\.5\)$",
-            r"^total de tiros de esquina \(9\.5\)$",
-            r"^total de tiros de esquina \(10\.5\)$",
+            r"^total de tiros de esquina \(\d+(\.\d+)?\)$",
             r"^más tiros de esquina$",
         ],
+        "Team Corners": [],
         "Cards": [
             r"^total de tarjetas \(4\.5\)$",
             r"^total de tarjetas \(3\.5\)$",
@@ -528,13 +563,11 @@ def _formatear_cuotas_betsafe_para_prompt(result: dict) -> str:
             r"^más tarjetas$",
             r"^más tarjetas \(3 opciones\)$",
         ],
-        "Goalscorers": [
-            r"^anotador en cualquier momento$",
-        ],
         "Match Stats": [
             r"^total de tiros \(\d+(\.\d+)?\)$",
             r"^total de tiros al arco \(\d+(\.\d+)?\)$",
         ],
+        "Team Match Stats": [],
         "Halves": [
             r"^1er tiempo - ganador$",
             r"^2º tiempo - ganador$",
@@ -550,7 +583,12 @@ def _formatear_cuotas_betsafe_para_prompt(result: dict) -> str:
         shown = []
         for mk, mdata in markets.items():
             name = mdata.get("name", "").lower()
-            if any(re.match(p, name) for p in patterns):
+            matches_filter = any(re.match(p, name) for p in patterns)
+            if cat_key == "Team Match Stats":
+                matches_filter = _is_team_total_shots_market(mdata.get("name", ""), home_team, away_team)
+            elif cat_key == "Team Corners":
+                matches_filter = _is_team_total_corners_market(mdata.get("name", ""), home_team, away_team)
+            if matches_filter:
                 selections = mdata.get("selections", [])
                 if selections:
                     sels = []
@@ -560,17 +598,21 @@ def _formatear_cuotas_betsafe_para_prompt(result: dict) -> str:
                         sels.append(f"{label}: @{odd}")
                     shown.append(f"  {mdata.get('name', mk)}: {' | '.join(sels)}")
         if shown:
-            # Sort Match Stats numerically by line value
-            if cat_key == "Match Stats":
+            # Sort shot markets numerically by line value when possible.
+            if cat_key in {"Corners", "Team Corners", "Match Stats", "Team Match Stats"}:
                 def _sort_key(item):
                     m = re.search(r'\((\d+(?:\.\d+)?)\)', item)
+                    if not m:
+                        m = re.search(r'(?:más|mas|menos)\s+de\s+(\d+(?:\.\d+)?)', item, re.IGNORECASE)
                     return float(m.group(1)) if m else 999
                 shown.sort(key=_sort_key)
             cat_label = {
                 "1X2": "GANADOR", "Over/Under": "GOLES", "BTTS": "BTTS",
                 "Double Chance": "DOBLE OPORTUNIDAD", "Asian Handicap": "HANDICAP ASIATICO",
-                "Corners": "CORNERS", "Cards": "TARJETAS", "Goalscorers": "GOLEADORES",
-                "Match Stats": "TIROS", "Halves": "TIEMPOS", "Specials": "CLASIFICACION",
+                "Corners": "CORNERS", "Cards": "TARJETAS",
+                "Team Corners": "CORNERS POR EQUIPO",
+                "Match Stats": "TIROS", "Team Match Stats": "TIROS POR EQUIPO",
+                "Halves": "TIEMPOS", "Specials": "CLASIFICACION",
             }.get(cat_key, cat_key.upper())
             partes.append(f"**{cat_label}**")
             for s in shown:

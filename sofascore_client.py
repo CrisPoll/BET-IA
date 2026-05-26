@@ -17,7 +17,7 @@ Endpoints utilizados:
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 
@@ -108,51 +108,79 @@ def _buscar_evento_por_fecha(
     Returns:
         Dict del evento SofaScore o None si no se encuentra.
     """
-    # Extraer fecha YYYY-MM-DD
-    try:
-        if "T" in fecha_str:
-            fecha_solo = fecha_str.split("T")[0]
-        else:
-            fecha_solo = fecha_str[:10]
-    except (IndexError, TypeError):
+    fechas = _fechas_candidatas_sofascore(fecha_str)
+    if not fechas:
         return None
 
     home_norm = normalizar_nombre(home_team)
     away_norm = normalizar_nombre(away_team)
 
-    url = f"{SOFASCORE_API}/sport/football/scheduled-events/{fecha_solo}"
-    try:
-        resp = session.get(url, timeout=15)
-        if resp.status_code != 200:
-            return None
-    except Exception:
-        return None
+    for fecha_solo in fechas:
+        url = f"{SOFASCORE_API}/sport/football/scheduled-events/{fecha_solo}"
+        try:
+            resp = session.get(url, timeout=15)
+            if resp.status_code != 200:
+                continue
+        except Exception:
+            continue
 
-    try:
-        data = resp.json()
-    except Exception:
-        return None
+        try:
+            data = resp.json()
+        except Exception:
+            continue
 
-    events = data.get("events", [])
+        events = data.get("events", [])
 
-    for event in events:
-        e_home = normalizar_nombre(
-            event.get("homeTeam", {}).get("name", "")
-        )
-        e_away = normalizar_nombre(
-            event.get("awayTeam", {}).get("name", "")
-        )
+        for event in events:
+            e_home = normalizar_nombre(
+                event.get("homeTeam", {}).get("name", "")
+            )
+            e_away = normalizar_nombre(
+                event.get("awayTeam", {}).get("name", "")
+            )
 
-        # Coincidencia exacta o substring (equipo local)
-        if home_norm and away_norm:
-            if (home_norm == e_home and away_norm == e_away):
-                return event
-            # Coincidencia parcial (ej: "Real Madrid" vs "Real Madrid CF")
-            if (home_norm in e_home or e_home in home_norm) and \
-               (away_norm in e_away or e_away in away_norm):
-                return event
+            # Coincidencia exacta o substring (equipo local)
+            if home_norm and away_norm:
+                if (home_norm == e_home and away_norm == e_away):
+                    return event
+                # Coincidencia parcial (ej: "Real Madrid" vs "Real Madrid CF")
+                if (home_norm in e_home or e_home in home_norm) and \
+                   (away_norm in e_away or e_away in away_norm):
+                    return event
 
     return None
+
+
+def _fechas_candidatas_sofascore(fecha_str: str) -> list[str]:
+    """Devuelve fechas candidatas para SofaScore, tolerando offsets horarios.
+
+    BSD a veces trae fecha ISO con zona europea para partidos CONMEBOL. SofaScore
+    lista el calendario por la fecha real del evento; por eso probamos la fecha
+    original, la fecha UTC equivalente y un día alrededor.
+    """
+    try:
+        raw = str(fecha_str or "")
+        base = raw.split("T")[0] if "T" in raw else raw[:10]
+        dates = []
+        if base:
+            dates.append(datetime.fromisoformat(base).date())
+        if "T" in raw:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            dates.append(dt.date())
+            if dt.tzinfo:
+                dates.append(dt.astimezone(timezone.utc).date())
+    except (TypeError, ValueError):
+        return []
+
+    ordered = []
+    seen = set()
+    for day in dates:
+        for candidate in (day, day - timedelta(days=1), day + timedelta(days=1)):
+            value = candidate.isoformat()
+            if value not in seen:
+                ordered.append(value)
+                seen.add(value)
+    return ordered
 
 
 def obtener_alineaciones(session, event_id: int) -> dict | None:
@@ -887,11 +915,63 @@ def _extraer_info_alineacion(lineups_data: dict, side: str) -> dict:
             titulares.append(entry)
 
     return {
-        "confirmada": True,
+        "confirmada": bool(lineups_data.get("confirmed", False)),
         "formacion": formation,
         "titulares": titulares,
         "suplentes": suplentes,
+        "bajas": _extraer_missing_players_sofascore(team_data.get("missingPlayers", [])),
     }
+
+
+def _extraer_missing_players_sofascore(missing_players: list) -> dict:
+    """Extrae lesionados/suspendidos/dudas desde lineups.missingPlayers."""
+    bajas = {"confirmadas": [], "dudas": []}
+    if not missing_players:
+        return bajas
+
+    for item in missing_players:
+        player = item.get("player", {}) or {}
+        tipo = (item.get("type") or "").lower()
+        desc = item.get("description") or ""
+        estado = _estado_missing_player(item)
+        entry = {
+            "nombre": player.get("name") or player.get("shortName") or "?",
+            "posicion": player.get("position", "?"),
+            "dorsal": player.get("jerseyNumber", "?"),
+            "estado": estado,
+            "motivo": desc or _motivo_missing_player(item),
+        }
+        if item.get("expectedEndDate"):
+            entry["fecha_fin_estimada"] = item["expectedEndDate"][:10]
+
+        if tipo == "doubtful" or estado == "doubtful":
+            bajas["dudas"].append(entry)
+        else:
+            bajas["confirmadas"].append(entry)
+
+    return bajas
+
+
+def _estado_missing_player(item: dict) -> str:
+    tipo = (item.get("type") or "").lower()
+    desc = (item.get("description") or "").lower()
+    reason = item.get("reason")
+    if tipo == "doubtful":
+        return "doubtful"
+    if reason == 12 or "suspension" in desc or "red_card" in desc or "yellow_or_red" in desc:
+        return "suspended"
+    if reason == 1 or "injury" in desc or "injured" in desc:
+        return "injured"
+    return tipo or "missing"
+
+
+def _motivo_missing_player(item: dict) -> str:
+    estado = _estado_missing_player(item)
+    if estado == "suspended":
+        return "Suspension"
+    if estado in {"injured", "doubtful"}:
+        return "Injury"
+    return "No disponible"
 
 
 def enriquecer_datos_partido(datos_bsd: dict) -> dict:
@@ -963,7 +1043,7 @@ def enriquecer_datos_partido(datos_bsd: dict) -> dict:
                 team_ids.add(home_team_id)
             if away_team_id:
                 team_ids.add(away_team_id)
-            futures[pool.submit(_obtener_standings, session, liga, team_ids)] = "standings"
+            futures[pool.submit(_obtener_standings, session, liga, team_ids, tournament_uid, season_id)] = "standings"
         # Nuevos endpoints avanzados
         futures[pool.submit(obtener_shotmap, session, event_id)] = "shotmap"
         futures[pool.submit(obtener_momentum, session, event_id)] = "momentum"
@@ -1077,12 +1157,11 @@ def enriquecer_datos_partido(datos_bsd: dict) -> dict:
                 torneo_actual = enriquecido.get("torneo", "")
                 ss_yc = arb_stats.get("yc_pp")
                 ss_rc = arb_stats.get("rc_pp")
+                torneo_ref = _buscar_torneo_arbitro_actual(arb_stats, torneo_actual)
                 # Buscar YC/part especifica del torneo actual
-                for t in arb_stats.get("torneos", []):
-                    if t.get("nombre") == torneo_actual:
-                        ss_yc = t.get("yc_pp", ss_yc)
-                        ss_rc = t.get("rc_pp", ss_rc)
-                        break
+                if torneo_ref:
+                    ss_yc = torneo_ref.get("yc_pp", ss_yc)
+                    ss_rc = torneo_ref.get("rc_pp", ss_rc)
                 datos_bsd["arbitro"] = {
                     **existing,
                     "nombre": arb_stats.get("nombre") or existing.get("nombre"),
@@ -1092,6 +1171,8 @@ def enriquecer_datos_partido(datos_bsd: dict) -> dict:
                     "total_yellow_cards": arb_stats.get("yc_total") or existing.get("total_yellow_cards"),
                     "total_red_cards": arb_stats.get("rc_total") or existing.get("total_red_cards"),
                     "_fuente_yc": "SofaScore",
+                    "_sofascore_ref": arb_stats,
+                    "_sofascore_competicion": torneo_ref,
                 }
         except Exception:
             pass
@@ -1240,12 +1321,8 @@ def _formatear_detalle_evento_para_prompt(datos: dict) -> str:
         if detalle.get("manager_visitante"):
             partes.append(f"Manager {away_team}: {detalle['manager_visitante'].get('nombre', '?')}")
 
-    # NOTA: SofaScore ya no expone lesiones via API (endpoint removido).
-    # Las lesiones ahora vienen de BSD (seccion BAJAS BSD en el prompt).
-    # Las alineaciones de SofaScore siguen siendo autoritativas para quien JUEGA.
-    partes.append("\n**NOTA SOBRE LESIONES**: SofaScore ya no proporciona datos de lesiones via API.")
-    partes.append("Usa los datos de BAJAS BSD como referencia de lesionados/suspendidos, pero con PRECAUCION.")
-    partes.append("La ALINEACION de SofaScore es la unica fuente confiable de quien JUEGA.")
+    partes.append("\n**NOTA SOBRE DISPONIBILIDAD**: SofaScore es la fuente principal para alineaciones y bajas cuando `missingPlayers` está disponible en lineups.")
+    partes.append("Usa BAJAS BSD solo como respaldo/comparación si SofaScore no lista bajas.")
 
     # Detectar conflictos BSD vs SofaScore
     conflictos = _detectar_conflictos(datos, detalle)
@@ -1317,13 +1394,14 @@ def _formatear_alineaciones_para_prompt(datos: dict) -> str:
 
     partes = []
     partes.append("\n### ALINEACIONES (SofaScore)")
-    partes.append("ATENCION: Estas alineaciones son la UNICA fuente de disponibilidad de jugadores. No uses datos de bajas de BSD.")
+    partes.append("ATENCION: Estas alineaciones y bajas de SofaScore son la fuente principal de disponibilidad. No uses BSD si contradice SofaScore.")
 
     for lado, equipo, data in [("local", local_team, alin.get("local", {})),
                                 ("visitante", away_team, alin.get("visitante", {}))]:
-        if not data.get("confirmada"):
+        if not data:
             continue
-        partes.append(f"\n**{equipo}** ({data.get('formacion', '?')})")
+        estado_alineacion = "CONFIRMADA" if data.get("confirmada") else "PRELIMINAR/POSIBLE"
+        partes.append(f"\n**{equipo}** ({data.get('formacion', '?')}) - {estado_alineacion}")
 
         titulares = data.get("titulares", [])
         if titulares:
@@ -1335,50 +1413,159 @@ def _formatear_alineaciones_para_prompt(datos: dict) -> str:
             nombres = [f"{t['nombre']} ({t['posicion']})" for t in suplentes]
             partes.append(f"  Suplentes: {', '.join(nombres)}")
 
-    partes.append("\nIMPORTANTE: Esta es la alineacion oficial. Los jugadores listados aqui SON los que juegan. No asumas bajas adicionales de otras fuentes.")
+        bajas = data.get("bajas", {})
+        confirmadas = bajas.get("confirmadas", [])
+        dudas = bajas.get("dudas", [])
+        if confirmadas:
+            partes.append("  No disponibles SofaScore:")
+            for baja in confirmadas:
+                motivo = f" - {baja.get('motivo')}" if baja.get("motivo") else ""
+                fecha = f" (fin est.: {baja.get('fecha_fin_estimada')})" if baja.get("fecha_fin_estimada") else ""
+                partes.append(f"    - {baja.get('nombre', '?')} ({baja.get('posicion', '?')}): {baja.get('estado', '?')}{motivo}{fecha}")
+        if dudas:
+            partes.append("  Dudas SofaScore:")
+            for baja in dudas:
+                motivo = f" - {baja.get('motivo')}" if baja.get("motivo") else ""
+                fecha = f" (fin est.: {baja.get('fecha_fin_estimada')})" if baja.get("fecha_fin_estimada") else ""
+                partes.append(f"    - {baja.get('nombre', '?')} ({baja.get('posicion', '?')}): {baja.get('estado', '?')}{motivo}{fecha}")
+
+    partes.append("\nIMPORTANTE: Si la alineacion es CONFIRMADA, los titulares/suplentes listados por SofaScore son los disponibles para jugar. Si es PRELIMINAR/POSIBLE, usalos solo como probable XI. Los jugadores en 'No disponibles SofaScore' NO deben contarse como disponibles; las 'Dudas' tienen disponibilidad incierta.")
     return "\n".join(partes)
 
 
-def _obtener_standings(session, liga: str, team_ids: set) -> dict:
-    """Obtiene la tabla de posiciones y extrae los datos de los equipos del partido."""
+def _formatear_bajas_sofascore_para_prompt(datos: dict) -> str:
+    """Formatea bajas/dudas extraídas de SofaScore lineups.missingPlayers."""
+    sofas = datos.get("_sofascore", {})
+    alin = sofas.get("alineaciones", {}) if sofas.get("disponible") else {}
+    if not alin:
+        return ""
+
+    local_team = datos.get("partido", "").split(" vs ")[0] if " vs " in datos.get("partido", "") else "Local"
+    away_team = datos.get("partido", "").split(" vs ")[1] if " vs " in datos.get("partido", "") else "Visitante"
+
+    partes = []
+    for side, team_name in [("local", local_team), ("visitante", away_team)]:
+        bajas = (alin.get(side, {}) or {}).get("bajas", {})
+        confirmadas = bajas.get("confirmadas", [])
+        dudas = bajas.get("dudas", [])
+        if not confirmadas and not dudas:
+            continue
+        partes.append(f"\n**{team_name}**")
+        if confirmadas:
+            partes.append("No disponibles:")
+            for baja in confirmadas:
+                motivo = f" - {baja.get('motivo')}" if baja.get("motivo") else ""
+                fecha = f" (fin est.: {baja.get('fecha_fin_estimada')})" if baja.get("fecha_fin_estimada") else ""
+                partes.append(f"  - {baja.get('nombre', '?')} ({baja.get('posicion', '?')}): {baja.get('estado', '?')}{motivo}{fecha}")
+        if dudas:
+            partes.append("Dudas:")
+            for baja in dudas:
+                motivo = f" - {baja.get('motivo')}" if baja.get("motivo") else ""
+                fecha = f" (fin est.: {baja.get('fecha_fin_estimada')})" if baja.get("fecha_fin_estimada") else ""
+                partes.append(f"  - {baja.get('nombre', '?')} ({baja.get('posicion', '?')}): {baja.get('estado', '?')}{motivo}{fecha}")
+
+    if not partes:
+        return "(SofaScore no lista bajas/dudas en lineups para este partido.)"
+
+    return "\n".join([
+        "### BAJAS SOFASCORE (fuente principal)",
+        "Usa estas bajas/dudas por encima de BSD. Si la alineación está confirmada, titulares/suplentes de SofaScore juegan; si está preliminar, trátalos como probable XI.",
+        *partes,
+    ])
+
+
+def _obtener_standings(session, liga: str, team_ids: set, tournament_uid: int = None, season_id: int = None) -> dict:
+    """Obtiene la tabla de posiciones relevante para el partido.
+
+    En torneos con grupos, SofaScore devuelve una lista de tablas. Para no
+    mezclar todos los grupos, se conserva solo el grupo donde aparecen los
+    equipos del partido. En ligas de tabla única, se conserva la tabla completa.
+    """
+    candidates = []
+    if tournament_uid and season_id:
+        candidates.append((tournament_uid, season_id))
+
     mapping = STANDINGS_MAP.get(liga)
-    if not mapping:
+    if mapping and mapping not in candidates:
+        candidates.append(mapping)
+
+    if not candidates:
         return {}
-    uid, sid = mapping
-    try:
-        resp = session.get(f"{SOFASCORE_API}/unique-tournament/{uid}/season/{sid}/standings/total", timeout=15)
-        if resp.status_code != 200:
-            return {}
-        data = resp.json()
-        result = {}
-        for st in data.get("standings", []):
+
+    for uid, sid in candidates:
+        try:
+            resp = session.get(f"{SOFASCORE_API}/unique-tournament/{uid}/season/{sid}/standings/total", timeout=15)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+        except Exception:
+            continue
+
+        result = _extraer_standings_relevantes(data, liga, team_ids)
+        if result:
+            return result
+
+    return {}
+
+
+def _extraer_standings_relevantes(data: dict, liga: str, team_ids: set) -> dict:
+    standings = data.get("standings", [])
+    if not standings:
+        return {}
+
+    selected_standings = standings
+    if len(standings) > 1 and team_ids:
+        groups_with_all_match_teams = []
+        groups_with_any_match_team = []
+        for st in standings:
             rows = st.get("rows", [])
-            for row in rows:
-                team = row.get("team", {})
-                tid = team.get("id")
-                if tid in team_ids or len(rows) > 0:
-                    info = {
-                        "posicion": row.get("position"),
-                        "puntos": row.get("points"),
-                        "partidos_jugados": row.get("matches"),
-                        "goles_favor": row.get("scoresFor"),
-                        "goles_contra": row.get("scoresAgainst"),
-                        "diferencia": (row.get("scoresFor", 0) or 0) - (row.get("scoresAgainst", 0) or 0),
-                        "victorias": row.get("wins"),
-                        "empates": row.get("draws"),
-                        "derrotas": row.get("losses"),
-                        "forma": row.get("form", ""),
-                        "descripcion": ", ".join(row.get("descriptions", [])) if row.get("descriptions") else "",
-                    }
-                    result[team.get("name", "")] = info
-            # Info general de la liga
-            result["_liga_info"] = {
-                "total_equipos": len(rows),
-                "nombre_tabla": st.get("name", liga),
+            row_team_ids = {row.get("team", {}).get("id") for row in rows}
+            if team_ids.issubset(row_team_ids):
+                groups_with_all_match_teams.append(st)
+            elif row_team_ids & team_ids:
+                groups_with_any_match_team.append(st)
+        if groups_with_all_match_teams:
+            selected_standings = groups_with_all_match_teams
+        elif groups_with_any_match_team:
+            selected_standings = groups_with_any_match_team
+
+    result = {}
+    total_rows = 0
+    table_names = []
+    tie_rules = []
+    for st in selected_standings:
+        rows = st.get("rows", [])
+        if st.get("name"):
+            table_names.append(st["name"])
+        if st.get("tieBreakingRule", {}).get("text"):
+            tie_rules.append(st["tieBreakingRule"]["text"])
+        total_rows += len(rows)
+        for row in rows:
+            team = row.get("team", {})
+            promotion = row.get("promotion") or {}
+            info = {
+                "posicion": row.get("position"),
+                "puntos": row.get("points"),
+                "partidos_jugados": row.get("matches"),
+                "goles_favor": row.get("scoresFor"),
+                "goles_contra": row.get("scoresAgainst"),
+                "diferencia": (row.get("scoresFor", 0) or 0) - (row.get("scoresAgainst", 0) or 0),
+                "victorias": row.get("wins"),
+                "empates": row.get("draws"),
+                "derrotas": row.get("losses"),
+                "forma": row.get("form", ""),
+                "zona": promotion.get("text", ""),
+                "descripcion": ", ".join(row.get("descriptions", []) or []),
             }
-        return result
-    except Exception:
-        return {}
+            result[team.get("name", "")] = info
+
+    result["_liga_info"] = {
+        "total_equipos": total_rows,
+        "nombre_tabla": " / ".join(table_names) if table_names else liga,
+        "fuente": "SofaScore",
+        "regla_desempate": tie_rules[0] if tie_rules else "",
+    }
+    return result
 
 
 def _formatear_standings_para_prompt(datos: dict) -> str:
@@ -1394,6 +1581,8 @@ def _formatear_standings_para_prompt(datos: dict) -> str:
     liga_info = standings.get("_liga_info", {})
     total_equipos = liga_info.get("total_equipos", "?")
     league_name = liga_info.get("nombre_tabla", datos.get("liga", "?"))
+    fuente = liga_info.get("fuente")
+    regla_desempate = liga_info.get("regla_desempate")
 
     def _find_team(name, standings):
         if name in standings:
@@ -1413,12 +1602,18 @@ def _formatear_standings_para_prompt(datos: dict) -> str:
 
     partes = [f"\n### TABLA DE POSICIONES COMPLETA ({league_name})"]
     partes.append(f"Total equipos: {total_equipos}")
+    if fuente:
+        partes.append(f"Fuente tabla: {fuente}")
+    if regla_desempate:
+        primera_linea_regla = regla_desempate.splitlines()[0]
+        partes.append(f"Regla desempate: {primera_linea_regla}")
 
     if local_info:
         desc = f" ({local_info.get('descripcion')})" if local_info.get("descripcion") else ""
         form_str = f" | Forma: {local_info.get('forma')}" if local_info.get("forma") else ""
+        zona_str = f" | Zona: {local_info.get('zona')}" if local_info.get("zona") else ""
         partes.append(
-            f"\n*** LOCAL: {local_key}** "
+            f"\n**LOCAL: {local_key}** "
             f"#{local_info.get('posicion', '?')} de {total_equipos} | "
             f"PTS: {local_info.get('puntos', '?')} | "
             f"PJ: {local_info.get('partidos_jugados', '?')} | "
@@ -1427,13 +1622,14 @@ def _formatear_standings_para_prompt(datos: dict) -> str:
             f"D: {local_info.get('derrotas', '?')} | "
             f"GF: {local_info.get('goles_favor', '?')} | "
             f"GC: {local_info.get('goles_contra', '?')} | "
-            f"DG: {local_info.get('diferencia', '?')}{desc}{form_str}"
+            f"DG: {local_info.get('diferencia', '?')}{zona_str}{desc}{form_str}"
         )
     if away_info:
         desc = f" ({away_info.get('descripcion')})" if away_info.get("descripcion") else ""
         form_str = f" | Forma: {away_info.get('forma')}" if away_info.get("forma") else ""
+        zona_str = f" | Zona: {away_info.get('zona')}" if away_info.get("zona") else ""
         partes.append(
-            f"*** VISITANTE: {away_key}** "
+            f"**VISITANTE: {away_key}** "
             f"#{away_info.get('posicion', '?')} de {total_equipos} | "
             f"PTS: {away_info.get('puntos', '?')} | "
             f"PJ: {away_info.get('partidos_jugados', '?')} | "
@@ -1442,7 +1638,7 @@ def _formatear_standings_para_prompt(datos: dict) -> str:
             f"D: {away_info.get('derrotas', '?')} | "
             f"GF: {away_info.get('goles_favor', '?')} | "
             f"GC: {away_info.get('goles_contra', '?')} | "
-            f"DG: {away_info.get('diferencia', '?')}{desc}{form_str}"
+            f"DG: {away_info.get('diferencia', '?')}{zona_str}{desc}{form_str}"
         )
 
     partes.append(f"\n**TABLA COMPLETA ({league_name})**")
@@ -1468,6 +1664,7 @@ def _formatear_standings_para_prompt(datos: dict) -> str:
             f"PJ:{pj}",
             f"GF:GC {g}",
             f"DG:{dg}",
+            f"Zona:{info.get('zona', '-') or '-'}",
             f"Forma:{info.get('forma', '-')}",
         ]
         extra = f" {info.get('descripcion')}" if info.get("descripcion") else ""
@@ -2089,6 +2286,37 @@ def obtener_datos_arbitro_sofascore(session, arb_id: int) -> dict | None:
     return result
 
 
+def _normalizar_torneo_ref(nombre: str) -> str:
+    """Normaliza nombres de torneo para comparar evento vs stats de árbitro."""
+    n = normalizar_nombre(nombre or "").lower()
+    n = re.sub(r",?\s*group\s+[a-z0-9]+$", "", n).strip()
+    n = re.sub(r",?\s*grupo\s+[a-z0-9]+$", "", n).strip()
+    return n
+
+
+def _buscar_torneo_arbitro_actual(arb_stats: dict, torneo_actual: str) -> dict | None:
+    """Devuelve la fila de stats arbitral que corresponde al torneo del partido."""
+    torneos = arb_stats.get("torneos", []) if isinstance(arb_stats, dict) else []
+    if not torneos or not torneo_actual:
+        return None
+
+    actual = _normalizar_torneo_ref(torneo_actual)
+    if not actual:
+        return None
+
+    for t in torneos:
+        tn = _normalizar_torneo_ref(t.get("nombre", ""))
+        if tn == actual:
+            return t
+
+    for t in torneos:
+        tn = _normalizar_torneo_ref(t.get("nombre", ""))
+        if tn and (tn in actual or actual in tn):
+            return t
+
+    return None
+
+
 def enriquecer_arbitro_sofascore(datos_resumidos: dict, url: str) -> dict:
     """Enriquece datos del arbitro desde URL de SofaScore."""
     arb_id = _extraer_id_arbitro_desde_url(url)
@@ -2215,6 +2443,8 @@ def obtener_datos_completos_sofascore(partido: dict) -> dict:
     liga = partido.get("_league_name", "?")
 
     resultado = {
+        "id": match_id,
+        "match_id": match_id,
         "partido": f"{home_team} vs {away_team}",
         "liga": liga,
         "fecha": partido.get("event_date", ""),

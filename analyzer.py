@@ -7,6 +7,7 @@ Mantiene compatibilidad con llamadas anteriores (analizar_partido).
 
 import os
 import json
+import re
 from openai import OpenAI
 from dotenv import load_dotenv
 from sofascore_client import (
@@ -40,7 +41,6 @@ import prediction_db as db
 from bankroll import (
     evaluate_stat_market,
     evaluate_1x2,
-    format_recommendations,
     calibrate_probability,
     calculate_kelly_stake,
 )
@@ -100,7 +100,7 @@ Antes de proyectar cualquier estadística, analiza el contexto. Sin contexto, lo
 
 a) ¿QUÉ SE JUEGA? (MOTIVACIÓN):
    - ATENCION: La Ronda/Fase en BSD v2 indica si es final, semifinal, grupos o liga. Si es FINAL: partido unico, no hay tabla, motivacion maxima.
-   - Mira la tabla de posiciones (si aplica). ¿Cuántos partidos quedan en la temporada? (total equipos - 1 - PJ jugados)
+   - Mira la tabla de posiciones (si aplica). ¿Cuántos partidos quedan según el formato real? En grupos CONMEBOL suelen ser 6 PJ; en ligas ida/vuelta suele ser (total equipos - 1) * 2. Si el formato no está claro, declara incertidumbre y no inventes escenarios.
    - ¿Equipo peleando título, clasificación a copa, descenso, o sin nada en juego?
    - ¿Es eliminatoria (ida/vuelta)? ¿El resultado de ida condiciona el planteamiento?
    - Equipos sin nada que jugar tienden a partidos más abiertos o más apáticos. Evalúa cuál aplica según perfil del DT.
@@ -200,8 +200,11 @@ REGLAS GENERALES DE PONDERACIÓN
 CUOTAS DE BETSAFE
 ═══════════════════════════════════════
 - Betsafe es la fuente OFICIAL de cuotas. Ignora BSD.
-- Mercados estadísticos disponibles (varian por partido): Total de Tiros (TSTOUM), Tiros al Arco (TOSG), Total Corners (TOCO), Total Amarillas (TOYC), Goles 1T (1HTG), Goles 2T (2HTG), BTTS 1T/2T.
+- Mercados estadísticos disponibles (varian por partido): Total de Tiros (TSTOUM), Total de tiros por equipo ("Equipo - Total de tiros"), Tiros al Arco (TOSG), Total Corners (TOCO), corners por equipo ("Equipo - Total de tiros de esquina"), Total Amarillas (TOYC), Goles 1T (1HTG), Goles 2T (2HTG), BTTS 1T/2T.
 - Para calcular edge en mercados estadísticos: compara tu proyección con la línea de Betsafe.
+- Compara mercados de total del partido contra la proyección total del partido.
+- En mercados "Equipo - Total de tiros" y "Equipo - Total de tiros de esquina", compara la línea contra la proyección Local/Visitante correspondiente.
+- No incluyas picks que contradigan tu propia proyección: Over solo si la mediana/rango central queda por encima de la línea; Under solo si queda por debajo. Si el rango cruza la línea o el edge es muy leve, omite el mercado.
 - Si cuota Over en algún mercado es <1.35, el mercado ya descuenta volumen alto. Solo recomienda Under con evidencia abrumadora.
 
 FORMATO DE RESPUESTA (sé conciso, no repitas datos ya mostrados en el prompt):
@@ -229,10 +232,12 @@ Razonamiento (ritmo esperado, quién marca primero, fatiga, urgencia)
 [PROYECCIÓN DE AMARILLAS]
 Local: X | Visitante: Y | Total: Z | 1T: ~X | 2T: ~Y
 Árbitro: [nombre] - [estilo: permisivo/moderado/estricto] - media YC en esta competición: X.X
+Si el árbitro NO está asignado, escribe exactamente: "Árbitro: no asignado; factor arbitral omitido." No infieras estilo ni media arbitral.
 Justificación (rivalidad, perfil de faltas de cada equipo, contexto)
 
 [PROYECCIÓN DE CORNERS]
-1T: X-Y | 2T: X-Y | Total: Z
+Local: X-Y | Visitante: X-Y | Total: Z
+1T: X-Y | 2T: X-Y
 Justificación (estilo ofensivo, laterales, centros, urgencia en 2T)
 
 [PROYECCIÓN DE FALTAS]
@@ -278,10 +283,19 @@ def _formatear_arbitro_header(datos: dict) -> str:
     ref_data = sf or ws or tm
     if ref_data:
         partes = [header]
+        comp_ref = arb.get("_sofascore_competicion") if arb.get("_fuente_yc") == "SofaScore" else None
+        if comp_ref:
+            partes.append(
+                f"- Media en competición actual ({comp_ref.get('nombre', 'torneo actual')}): "
+                f"{comp_ref.get('yc_pp', '?')} YC/part en {comp_ref.get('partidos', '?')} partidos"
+            )
+            if comp_ref.get("rc_pp") is not None:
+                partes.append(f"- Rojas/partido en competición actual: {comp_ref.get('rc_pp')}")
         if ref_data.get("total_partidos"):
             partes.append(f"- Partidos dirigidos: {ref_data['total_partidos']}")
         if ref_data.get("yc_pp") is not None:
-            partes.append(f"- Amarillas/partido: {ref_data['yc_pp']}")
+            label = "Amarillas/partido global" if comp_ref else "Amarillas/partido"
+            partes.append(f"- {label}: {ref_data['yc_pp']}")
         if ref_data.get("rc_pp") is not None:
             partes.append(f"- Rojas/partido: {ref_data['rc_pp']}")
         if ref_data.get("faltas_pp") is not None:
@@ -292,9 +306,16 @@ def _formatear_arbitro_header(datos: dict) -> str:
             partes.append("- Promedios por competición:")
             for t in torneos[:8]:
                 tn = t.get("nombre", "?")
+                apps = t.get("partidos")
                 yc = t.get("yc_pp", "?")
                 rc = t.get("rc_pp", "?")
-                partes.append(f"    {tn}: {yc} YC/part, {rc} RC/part")
+                pen = t.get("penaltis")
+                detalle = f"{yc} YC/part, {rc} RC/part"
+                if apps is not None:
+                    detalle = f"{apps} part, {detalle}"
+                if pen is not None:
+                    detalle += f", {pen} pen"
+                partes.append(f"    {tn}: {detalle}")
         return "\n".join(partes)
 
     # Fallback: BSD v2
@@ -334,7 +355,7 @@ def _formatear_proyeccion_cuantitativa(quant: dict) -> str:
         f"  Goles: Local {quant.get('goals_local', '?')} - Visitante {quant.get('goals_visitor', '?')} (Total: {quant.get('total_goals', '?')})",
         f"  Tiros: Local {quant.get('tiros_local', '?')} - Visitante {quant.get('tiros_visitor', '?')} (Total: {quant.get('tiros_total', '?')})",
         f"  Tiros al Arco: L {quant.get('tiros_arco_local', '?')} - V {quant.get('tiros_arco_visitor', '?')}",
-        f"  Corners: ~{quant.get('corners_total', '?')} total",
+        f"  Corners: Local {quant.get('corners_local', '?')} - Visitante {quant.get('corners_visitor', '?')} (Total: {quant.get('corners_total', '?')})",
         f"  Amarillas: ~{quant.get('yc_total', '?')} total",
         f"  Faltas: ~{quant.get('fouls', '?')}",
         f"  Prob BTTS: {quant.get('btts_yes', '?')} | Prob Over 2.5: {quant.get('over25_yes', '?')}",
@@ -376,7 +397,10 @@ PRIORIDAD: Proyecta estadísticas del partido (tiros, goles por mitad, amarillas
 
 ### TABLA DE POSICIONES
 {_format_standings_section(datos_resumidos)}
-IMPORTANTE: Usa la tabla para determinar CUANTOS PARTIDOS QUEDAN (total equipos - 1 = partidos en la temporada, resta los PJ de cada equipo). Si un equipo ya completó su cupo o le quedan pocos partidos, eso define la urgencia y motivación.
+IMPORTANTE: Usa la tabla para determinar PTS, PJ, V/E/D, GF, GC, DG, posición, partidos restantes y escenarios de clasificación/descenso. Si no hay tabla disponible, dilo explícitamente y no inventes puntos ni escenarios.
+
+### CONTEXTO COMPETITIVO DERIVADO
+{_format_competitive_context(datos_resumidos)}
 
 ### ESTILOS DE ENTRENADORES (BSD v2)
 {resumir_manager_v2_para_prompt(datos_resumidos)}
@@ -394,16 +418,12 @@ IMPORTANTE: Usa la tabla para determinar CUANTOS PARTIDOS QUEDAN (total equipos 
 - Confianza del modelo: {prediccion_resumida.get('confianza_modelo', 'N/D')}
 
 ### ALINEACIÓN DEL PARTIDO (SofaScore)
-- La alineación de SofaScore es la única fuente de disponibilidad de jugadores.
-- Si hay CONFLICTOS BSD vs SofaScore, SofaScore MANDA (el jugador JUEGA).
-{f"### ALINEACIÓN CONFIRMADA (SofaScore)\\n- {json.dumps(datos_resumidos.get('_sofascore', {}).get('alineaciones', {}), indent=2, ensure_ascii=False)}" if datos_resumidos.get("_sofascore", {}).get("alineaciones", {}).get("local", {}).get("confirmada") else ""}
-{f"### ALINEACIÓN PRELIMINAR (NO CONFIRMADA)\\n- {json.dumps(datos_resumidos.get('_sofascore', {}).get('alineaciones', {}), indent=2, ensure_ascii=False)}" if datos_resumidos.get("_sofascore", {}).get("alineaciones") and not datos_resumidos.get("_sofascore", {}).get("alineaciones", {}).get("local", {}).get("confirmada") else ""}
-{f"### SIN ALINEACIÓN DISPONIBLE\\n- SofaScore no tiene alineación todavía (suele salir ~1h antes del partido). Asume plantilla tipo." if not datos_resumidos.get("_sofascore", {}).get("alineaciones") else ""}
+- La alineación y `missingPlayers` de SofaScore son la fuente principal de disponibilidad de jugadores.
+- Si la alineación está CONFIRMADA, SofaScore MANDA. Si está PRELIMINAR/POSIBLE, úsala como probable XI.
+- En bajas/dudas, `missingPlayers` de SofaScore manda sobre BSD.
+{f"### SIN ALINEACIÓN DISPONIBLE\n- SofaScore no tiene alineación todavía (suele salir ~1h antes del partido). Asume plantilla tipo." if not datos_resumidos.get("_sofascore", {}).get("alineaciones") else ""}
 
-### BAJAS BSD (lesionados/suspendidos - referencia secundaria)
-{json.dumps(datos_resumidos.get('bajas_bsd', {}), indent=2, ensure_ascii=False)}
-- NOTA: Si un jugador está aquí Y NO en SofaScore -> probable baja real.
-- Si un jugador está aquí Y SÍ en SofaScore -> JUEGA.
+{_format_bajas_bsd_section(datos_resumidos)}
 
 ---
 ## DATOS ESTADÍSTICOS DETALLADOS (fuente principal para proyecciones)
@@ -425,7 +445,7 @@ IMPORTANTE: Usa la tabla para determinar CUANTOS PARTIDOS QUEDAN (total equipos 
 {_v2_sections(datos_resumidos)}
 
 ---
-Analiza los datos anteriores. PRIORIZA las proyecciones estadísticas (tiros, goles por mitad, amarillas, corners, faltas). Usa el CONTEXSO como base de todas tus proyecciones. El análisis 1X2/BTTS/Over 2.5 es SECUNDARIO y debe ir al final.
+Analiza los datos anteriores. PRIORIZA las proyecciones estadísticas (tiros, goles por mitad, amarillas, corners, faltas). Usa el CONTEXTO como base de todas tus proyecciones. El análisis 1X2/BTTS/Over 2.5 es SECUNDARIO y debe ir al final.
 """
     return prompt
 
@@ -443,16 +463,157 @@ def _format_standings_section(datos_resumidos: dict) -> str:
         _v2_standings_section(datos_resumidos),
     ]
     content = "\n".join(p for p in partes if p.strip())
-    return content if content.strip() else "(No hay tabla de posiciones disponible para este partido)"
+    if content.strip():
+        return content
+    if rn and _es_copa_con_grupos(liga, rn):
+        return "(Tabla de grupo no disponible en fuente confiable. No uses tablas globales de copa ni inventes puntos/escenarios.)"
+    return "(No hay tabla de posiciones disponible para este partido)"
+
+
+def _format_competitive_context(datos_resumidos: dict) -> str:
+    """Deriva motivación desde la tabla real del grupo cuando SofaScore la provee."""
+    standings = (datos_resumidos.get("_sofascore") or {}).get("standings") or {}
+    if not standings:
+        return "(Sin tabla SofaScore confiable: no afirmes escenarios de clasificación específicos.)"
+
+    local_team, away_team = _match_team_names(datos_resumidos)
+    local_key, local_info = _find_standing_team(local_team, standings)
+    away_key, away_info = _find_standing_team(away_team, standings)
+    rows = sorted(
+        [(k, v) for k, v in standings.items() if not str(k).startswith("_liga")],
+        key=lambda x: x[1].get("posicion") or 999,
+    )
+    if not local_info or not away_info or not rows:
+        return "(Tabla disponible, pero no se pudo vincular ambos equipos del partido.)"
+
+    total_equipos = (standings.get("_liga_info") or {}).get("total_equipos")
+    expected_matches = 6 if total_equipos == 4 else None
+    local_rest = _remaining_matches(local_info, expected_matches)
+    away_rest = _remaining_matches(away_info, expected_matches)
+
+    lines = []
+    if expected_matches:
+        lines.append(
+            f"- Formato detectado: grupo de {total_equipos} equipos, {expected_matches} PJ por equipo; "
+            f"restan {local_rest} para {local_key} y {away_rest} para {away_key}."
+        )
+
+    lines.append(
+        f"- {local_key}: #{local_info.get('posicion')} con {local_info.get('puntos')} pts, "
+        f"DG {local_info.get('diferencia')}, zona actual: {_zone(local_info)}."
+    )
+    lines.append(
+        f"- {away_key}: #{away_info.get('posicion')} con {away_info.get('puntos')} pts, "
+        f"DG {away_info.get('diferencia')}, zona actual: {_zone(away_info)}."
+    )
+
+    local_pos = local_info.get("posicion")
+    away_pos = away_info.get("posicion")
+    if total_equipos == 4 and expected_matches:
+        third = next((info for _, info in rows if info.get("posicion") == 3), None)
+        fourth = next((info for _, info in rows if info.get("posicion") == 4), None)
+        second = next((info for _, info in rows if info.get("posicion") == 2), None)
+
+        if away_pos == 1 and second:
+            second_max = (second.get("puntos") or 0) + 3 * _remaining_matches(second, expected_matches)
+            if (away_info.get("puntos") or 0) + 1 > second_max:
+                lines.append(f"- {away_key}: ya está en zona Playoffs/octavos; un empate asegura el 1er puesto del grupo.")
+            else:
+                lines.append(f"- {away_key}: ya está en zona Playoffs/octavos y pelea el 1er puesto del grupo.")
+
+        if local_pos == 3 and fourth:
+            local_draw_pts = (local_info.get("puntos") or 0) + 1
+            fourth_max = (fourth.get("puntos") or 0) + 3 * _remaining_matches(fourth, expected_matches)
+            if local_draw_pts > fourth_max:
+                lines.append(
+                    f"- {local_key}: lectura principal = asegurar 3er puesto/Copa Sudamericana; "
+                    "con empate queda fuera del alcance del 4º."
+                )
+            else:
+                lines.append(f"- {local_key}: pelea principalmente el 3er puesto/Copa Sudamericana.")
+
+        if local_pos and local_pos > 2 and third and second:
+            lines.append(
+                f"- No describas a {local_key} como obligado a ganar para clasificar a octavos salvo que el desempate lo permita; "
+                "desde la tabla está fuera de zona Playoffs y el objetivo directo es la zona indicada por SofaScore."
+            )
+
+    return "\n".join(lines)
+
+
+def _format_bajas_bsd_section(datos_resumidos: dict) -> str:
+    """Muestra bajas BSD solo si SofaScore no trajo missingPlayers."""
+    if _has_sofascore_missing_players(datos_resumidos):
+        return ""
+    bajas = datos_resumidos.get("bajas_bsd", {})
+    if not bajas:
+        return ""
+    return "\n".join([
+        "### BAJAS BSD (respaldo secundario)",
+        json.dumps(bajas, indent=2, ensure_ascii=False),
+        "- NOTA: Usa BSD solo porque SofaScore no listó bajas/dudas en lineups.",
+        "- Si un jugador está en BAJAS BSD pero aparece como titular/suplente en SofaScore -> JUEGA.",
+    ])
+
+
+def _has_sofascore_missing_players(datos_resumidos: dict) -> bool:
+    alin = ((datos_resumidos.get("_sofascore") or {}).get("alineaciones") or {})
+    for side in ("local", "visitante"):
+        bajas = (alin.get(side, {}) or {}).get("bajas", {})
+        if bajas.get("confirmadas") or bajas.get("dudas"):
+            return True
+    return False
+
+
+def _match_team_names(datos_resumidos: dict) -> tuple[str, str]:
+    partido = datos_resumidos.get("partido", "")
+    if " vs " not in partido:
+        return "Local", "Visitante"
+    return partido.split(" vs ", 1)
+
+
+def _find_standing_team(name: str, standings: dict) -> tuple[str | None, dict | None]:
+    if name in standings:
+        return name, standings[name]
+    name_low = name.lower()
+    for key, value in standings.items():
+        if str(key).startswith("_liga"):
+            continue
+        key_low = str(key).lower()
+        if name_low in key_low or key_low in name_low:
+            return key, value
+    return None, None
+
+
+def _remaining_matches(info: dict, expected_matches: int | None) -> int:
+    if expected_matches is None:
+        return 0
+    played = info.get("partidos_jugados") or 0
+    return max(expected_matches - played, 0)
+
+
+def _zone(info: dict) -> str:
+    return info.get("zona") or info.get("descripcion") or "sin zona marcada"
 
 
 def _v2_standings_section(datos_resumidos: dict) -> str:
     v2 = datos_resumidos.get("_bsd_v2", {})
     if not v2:
         return ""
+    rn = (datos_resumidos.get("_v2_detail") or {}).get("round_number")
+    liga = datos_resumidos.get("liga", "")
+    standings = v2.get("standings", {}) if isinstance(v2, dict) else {}
+    rows = standings.get("standings", []) if isinstance(standings, dict) else []
+    if rn and _es_copa_con_grupos(liga, rn) and len(rows) > 8:
+        return ""
     home_id = datos_resumidos.get("home_team_id")
     away_id = datos_resumidos.get("away_team_id")
     return resumir_standings_v2_para_prompt(v2, home_id, away_id)
+
+
+def _es_copa_con_grupos(liga: str, round_number: int) -> bool:
+    copas = ["Champions", "Europa", "Libertadores", "Sudamericana"]
+    return any(c in liga for c in copas) and round_number <= 8
 
 
 def _nombre_fase(liga: str, round_number: int) -> str:
@@ -479,10 +640,10 @@ def _nombre_fase(liga: str, round_number: int) -> str:
 
 def _es_fase_eliminatoria_final(liga: str, round_number: int) -> bool:
     """True si es una fase donde la tabla general no aplica.
-    Para copas: la tabla viene combinada (todos los grupos juntos) y confunde al LLM."""
+    En fase de grupos/fase liga, la tabla sí define motivación y urgencia."""
     copas = ["Champions", "Europa", "Libertadores", "Sudamericana"]
     if any(c in liga for c in copas):
-        return True  # Toda copa usa formato distinto a liga
+        return round_number > 8
     return False
 
 
@@ -517,7 +678,8 @@ def _v2_sections(datos_resumidos: dict) -> str:
     partes.append(resumir_stats_v2_para_prompt(v2))
     partes.append(resumir_player_stats_v2_para_prompt(v2))
     partes.append(resumir_metadata_v2_para_prompt(v2))
-    partes.append(resumir_squads_v2_para_prompt(v2))
+    if not (datos_resumidos.get("_sofascore") or {}).get("alineaciones"):
+        partes.append(resumir_squads_v2_para_prompt(v2))
     partes.append(resumir_arbitro_v2_para_prompt(datos_resumidos))
 
     return "\n".join(p for p in partes if p.strip())
@@ -593,10 +755,11 @@ def analizar_partido(datos_resumidos: dict, prediccion_resumida: dict) -> str:
     analysis_text = contenido
     llm_projections = _extract_llm_projections(analysis_text)
 
-    # 4. Evaluar Kelly stakes y agregar al output
-    kelly_section = _build_kelly_section(datos_resumidos, quant_projections)
-    if kelly_section:
-        analysis_text += f"\n\n═══════════════════════════════════════════\nRECOMENDACIONES CUANTITATIVAS (Kelly Criterion)\n═══════════════════════════════════════════\n{kelly_section}"
+    # 4. No anexar Kelly cuantitativo crudo al texto final.
+    # El LLM ya recibe la base cuantitativa y devuelve picks/stakes ajustados
+    # por contexto. Anexar Kelly desde quant_projections aquí puede contradecir
+    # esas proyecciones finales, porque usa la media base previa al ajuste
+    # cualitativo.
 
     # 5. Guardar en base de datos
     match_id = str(datos_resumidos.get("id", datos_resumidos.get("match_id", "unknown")))
@@ -626,7 +789,6 @@ def analizar_partido(datos_resumidos: dict, prediccion_resumida: dict) -> str:
 
 def _extract_llm_projections(text: str) -> dict:
     """Extrae proyecciones del texto del LLM de forma heurística para guardar en DB."""
-    import re
     proj = {}
     # Goles
     m = re.search(r"(?:goles|Goles)\s*:?\s*Local\s*(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)\s*Visitante", text, re.IGNORECASE)
@@ -662,83 +824,190 @@ def _extract_llm_projections(text: str) -> dict:
     return proj
 
 
-def _build_kelly_section(datos_resumidos: dict, quant_projections: dict) -> str:
-    """Construye la sección de Kelly stakes para mercados clave."""
-    betsafe = datos_resumidos.get("_cuotas", datos_resumidos.get("cuotas", {}))
-    markets = betsafe.get("markets", betsafe)
-    if not markets or not isinstance(markets, dict):
-        return ""
+def _to_float(value):
+    """Convierte cuotas/lineas de Betsafe a float tolerando coma decimal."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        clean = value.strip().replace(",", ".")
+        match = re.search(r"\d+(?:\.\d+)?", clean)
+        if match:
+            return float(match.group(0))
+    return None
 
-    lines = []
 
-    # Evaluar mercados estadísticos si hay líneas
-    # Nota: Las líneas exactas de Betsafe para stats suelen estar en markets como TSTOUM, TOCO, TOYC
-    # Extraemos las líneas de forma heurística si existen
-    for market_key in ["TSTOUM", "TOCO", "TOYC", "TOSG"]:
-        market = markets.get(market_key)
-        if not market:
+def _market_kind_from_name(name: str) -> str:
+    """Clasifica mercados estadísticos de Betsafe por nombre visible."""
+    n = (name or "").lower()
+    if "tiros al arco" in n or "shots on goal" in n or "on target" in n:
+        return "tiros_arco"
+    if "tiros de esquina" in n or "corners" in n or "corner" in n:
+        return "corners"
+    if "tarjetas" in n or "yellow cards" in n or "amarillas" in n:
+        return "tarjetas"
+    if "total de tiros" in n or "total shots" in n:
+        return "tiros"
+    return ""
+
+
+def _is_full_match_stat_total(name: str) -> bool:
+    """Evita mercados por equipo/mitad que no son comparables con la proyección total."""
+    n = (name or "").lower()
+    excluded = [
+        "1er tiempo", "1º tiempo", "primer tiempo", "1st half",
+        "2º tiempo", "2do tiempo", "segundo tiempo", "2nd half",
+        "mitad", "half",
+    ]
+    if any(token in n for token in excluded):
+        return False
+    if " - " in (name or ""):
+        return False
+    return True
+
+
+def _selection_side(label: str) -> str:
+    label = (label or "").lower()
+    if any(token in label for token in ("menos de", "under")):
+        return "under"
+    if any(token in label for token in ("mas de", "más de", "over")):
+        return "over"
+    return ""
+
+
+def _extract_line_from_text(*parts) -> float:
+    joined = " ".join(str(p) for p in parts if p)
+    matches = re.findall(r"\((\d+(?:[.,]\d+)?)\)|(?:mas|más|menos|over|under)\s*(?:de)?\s*(\d+(?:[.,]\d+)?)", joined, flags=re.IGNORECASE)
+    for grouped, direct in matches:
+        value = _to_float(grouped or direct)
+        if value is not None:
+            return value
+    return None
+
+
+def _iter_stat_markets(betsafe: dict):
+    """Normaliza mercados estadísticos aunque Betsafe use ids dinámicos."""
+    markets = betsafe.get("markets", betsafe) if isinstance(betsafe, dict) else {}
+    if not isinstance(markets, dict):
+        return []
+
+    normalized = []
+    template_map = {
+        "TSTOUM": "tiros",
+        "TOCO": "corners",
+        "TOYC": "tarjetas",
+        "TOSG": "tiros_arco",
+    }
+
+    for key, market in markets.items():
+        if not isinstance(market, dict):
             continue
-        # Normalmente Betsafe devuelve dict con 'over' y 'under' o 'line' + 'odds'
-        over_odds = None
-        under_odds = None
-        line = None
-        if isinstance(market, dict):
-            over_odds = market.get("over", market.get("Over"))
-            under_odds = market.get("under", market.get("Under"))
-            line = market.get("line", market.get("linea"))
-            if line is None and isinstance(over_odds, dict):
-                line = over_odds.get("line")
-                over_odds = over_odds.get("odds", over_odds.get("cuota"))
-            if line is None and isinstance(under_odds, dict):
-                line = under_odds.get("line")
-                under_odds = under_odds.get("odds", under_odds.get("cuota"))
+        name = market.get("name") or market.get("label") or str(key)
+        if not _is_full_match_stat_total(name):
+            continue
+        template = str(market.get("marketTemplateId") or market.get("templateId") or key).upper()
+        kind = _market_kind_from_name(name)
+        if not kind:
+            for marker, mapped in template_map.items():
+                if marker in template:
+                    kind = mapped
+                    break
+        if not kind:
+            continue
 
+        line = _to_float(market.get("line", market.get("linea", market.get("lineValue"))))
+        line = line if line is not None else _extract_line_from_text(name)
+        over_odds = market.get("over", market.get("Over"))
+        under_odds = market.get("under", market.get("Under"))
+
+        if isinstance(over_odds, dict):
+            line = line if line is not None else _to_float(over_odds.get("line", over_odds.get("linea")))
+            over_odds = over_odds.get("odds", over_odds.get("cuota", over_odds.get("odd")))
+        if isinstance(under_odds, dict):
+            line = line if line is not None else _to_float(under_odds.get("line", under_odds.get("linea")))
+            under_odds = under_odds.get("odds", under_odds.get("cuota", under_odds.get("odd")))
+
+        for sel in market.get("selections", []) or []:
+            label = sel.get("label") or sel.get("name") or ""
+            side = _selection_side(label)
+            if not side:
+                continue
+            odd = sel.get("odd", sel.get("odds", sel.get("cuota")))
+            if side == "over":
+                over_odds = odd
+            elif side == "under":
+                under_odds = odd
+            line = line if line is not None else _extract_line_from_text(label)
+
+        over_odds = _to_float(over_odds)
+        under_odds = _to_float(under_odds)
         if line is None or over_odds is None or under_odds is None:
             continue
 
-        metric_map = {"TSTOUM": "tiros", "TOCO": "corners", "TOYC": "tarjetas", "TOSG": "tiros al arco"}
-        proj_total = None
-        if market_key == "TSTOUM":
-            proj_total = quant_projections.get("tiros_total")
-        elif market_key == "TOCO":
-            proj_total = quant_projections.get("corners_total")
-        elif market_key == "TOYC":
-            proj_total = quant_projections.get("yc_total")
+        normalized.append({
+            "kind": kind,
+            "name": name,
+            "line": line,
+            "over_odds": over_odds,
+            "under_odds": under_odds,
+        })
 
+    return normalized
+
+
+def _projection_for_market(kind: str, quant_projections: dict):
+    if kind == "tiros":
+        return quant_projections.get("tiros_total")
+    if kind == "corners":
+        return quant_projections.get("corners_total")
+    if kind == "tarjetas":
+        return quant_projections.get("yc_total")
+    if kind == "tiros_arco":
+        local = quant_projections.get("tiros_arco_local")
+        visitor = quant_projections.get("tiros_arco_visitor")
+        if local is not None and visitor is not None:
+            return local + visitor
+    return None
+
+
+def _collect_best_stat_recommendations(betsafe: dict, quant_projections: dict):
+    metric_labels = {"tiros": "tiros", "corners": "corners", "tarjetas": "tarjetas", "tiros_arco": "tiros al arco"}
+    best_by_kind = {}
+
+    for market in _iter_stat_markets(betsafe):
+        proj_total = _projection_for_market(market["kind"], quant_projections)
         if proj_total is None:
             continue
-
         recs = evaluate_stat_market(
-            mercado=metric_map.get(market_key, market_key),
-            linea=float(line),
-            cuota_over=float(over_odds),
-            cuota_under=float(under_odds),
+            mercado=metric_labels.get(market["kind"], market["kind"]),
+            linea=market["line"],
+            cuota_over=market["over_odds"],
+            cuota_under=market["under_odds"],
             proj_total=proj_total,
             proj_std=2.0,
         )
-        if recs:
-            formatted = format_recommendations(recs)
-            if formatted and "Ninguna" not in formatted:
-                lines.append(f"  {market_key} (línea {line}):")
-                lines.append(formatted)
+        for rec in recs:
+            if not rec.recomendado:
+                continue
+            current = best_by_kind.get(market["kind"])
+            if current is None or rec.kelly_edge > current[1].kelly_edge:
+                best_by_kind[market["kind"]] = (market, rec)
 
-    # Evaluar 1X2 si hay cuotas
-    cl = markets.get("1X2", {}).get("local") if isinstance(markets.get("1X2"), dict) else betsafe.get("local")
-    cd = markets.get("1X2", {}).get("empate") if isinstance(markets.get("1X2"), dict) else betsafe.get("empate")
-    cv = markets.get("1X2", {}).get("visitante") if isinstance(markets.get("1X2"), dict) else betsafe.get("visitante")
+    return [best_by_kind[k] for k in sorted(best_by_kind)]
 
-    if cl and cd and cv:
-        # Calibrar probs usando quant_model
-        pl = calibrate_probability(quant_projections.get("btts_yes") or 0.5)  # fallback
-        # mejor: inferir de goles proyectados via Poisson aproximado
-        import math
-        gl = quant_projections.get("goals_local", 1.2)
-        gv = quant_projections.get("goals_visitor", 1.0)
-        # Aproximación muy básica para 1X2 desde goles esperados
-        lambda_sum = gl + gv
-        # Esto es solo un placeholder; el agente de valor del pipeline hace esto mejor
-        # Por ahora, omitimos 1X2 Kelly en el output directo si no hay probs claras
-        pass
+
+def _build_kelly_section(datos_resumidos: dict, quant_projections: dict) -> str:
+    """Construye la sección de Kelly stakes para mercados clave."""
+    betsafe = datos_resumidos.get("_cuotas", datos_resumidos.get("cuotas", {}))
+    lines = []
+    for market, rec in _collect_best_stat_recommendations(betsafe, quant_projections):
+        lines.append(
+            f"  {market['name']} (línea {market['line']}):\n"
+            f"  • {rec.mercado} | {rec.seleccion} @ {rec.cuota:.2f} | "
+            f"Prob: {rec.prob_estimada:.1%} | Edge: {rec.kelly_edge:.1%} | "
+            f"Stake: {rec.stake:.2f}u ({rec.stake_pct:.2f}%)"
+        )
 
     return "\n".join(lines) if lines else ""
 
@@ -746,60 +1015,19 @@ def _build_kelly_section(datos_resumidos: dict, quant_projections: dict) -> str:
 def _save_recommended_bets(pred_id: int, match_id: str, datos_resumidos: dict, quant_projections: dict):
     """Registra en DB las apuestas recomendadas por Kelly."""
     betsafe = datos_resumidos.get("_cuotas", datos_resumidos.get("cuotas", {}))
-    markets = betsafe.get("markets", betsafe)
-    if not markets or not isinstance(markets, dict):
-        return
-
-    for market_key in ["TSTOUM", "TOCO", "TOYC"]:
-        market = markets.get(market_key)
-        if not market or not isinstance(market, dict):
-            continue
-        over_odds = market.get("over", market.get("Over"))
-        under_odds = market.get("under", market.get("Under"))
-        line = market.get("line", market.get("linea"))
-        if isinstance(over_odds, dict):
-            line = line or over_odds.get("line")
-            over_odds = over_odds.get("odds", over_odds.get("cuota"))
-        if isinstance(under_odds, dict):
-            line = line or under_odds.get("line")
-            under_odds = under_odds.get("odds", under_odds.get("cuota"))
-        if line is None or over_odds is None or under_odds is None:
-            continue
-
-        metric_map = {"TSTOUM": "tiros", "TOCO": "corners", "TOYC": "tarjetas"}
-        proj_total = None
-        if market_key == "TSTOUM":
-            proj_total = quant_projections.get("tiros_total")
-        elif market_key == "TOCO":
-            proj_total = quant_projections.get("corners_total")
-        elif market_key == "TOYC":
-            proj_total = quant_projections.get("yc_total")
-
-        if proj_total is None:
-            continue
-
-        recs = evaluate_stat_market(
-            mercado=metric_map.get(market_key, market_key),
-            linea=float(line),
-            cuota_over=float(over_odds),
-            cuota_under=float(under_odds),
-            proj_total=proj_total,
-            proj_std=2.0,
+    for _, r in _collect_best_stat_recommendations(betsafe, quant_projections):
+        db.save_bet(
+            prediction_id=pred_id,
+            match_id=match_id,
+            mercado=r.mercado,
+            seleccion=r.seleccion,
+            cuota=r.cuota,
+            stake=r.stake,
+            unidades=r.unidades,
+            stake_pct=r.stake_pct,
+            kelly_edge=r.kelly_edge,
+            kelly_fraction=r.kelly_fraction,
         )
-        for r in recs:
-            if r.recomendado:
-                db.save_bet(
-                    prediction_id=pred_id,
-                    match_id=match_id,
-                    mercado=r.mercado,
-                    seleccion=r.seleccion,
-                    cuota=r.cuota,
-                    stake=r.stake,
-                    unidades=r.unidades,
-                    stake_pct=r.stake_pct,
-                    kelly_edge=r.kelly_edge,
-                    kelly_fraction=r.kelly_fraction,
-                )
 
 
 if __name__ == "__main__":

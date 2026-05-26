@@ -72,6 +72,96 @@ def _parse_form_string(form_str: str) -> int:
     return round(puntos / len(form_str), 2)
 
 
+def _first_number(*values):
+    for value in values:
+        if isinstance(value, (int, float)):
+            return value
+    return None
+
+
+def _num(value, default: float) -> float:
+    """Devuelve value si es numérico; si no, default."""
+    return float(value) if isinstance(value, (int, float)) else default
+
+
+def _season_per_match(stats: dict, key: str) -> Optional[float]:
+    value = stats.get(key)
+    matches = stats.get("matches_played")
+    if not isinstance(value, (int, float)) or not isinstance(matches, (int, float)) or matches <= 0:
+        return None
+    return round(value / matches, 2)
+
+
+def _sofascore_recent_avg(ss: dict, perf_key: str, stat_key: str) -> Optional[float]:
+    """Promedio reciente de SofaScore para un equipo, escogiendo home/away del partido histórico."""
+    perf = ss.get(perf_key, {})
+    detalle = perf.get("detalle", [])
+    stats_list = ss.get(f"{perf_key}_stats_per_match", [])
+    values = []
+    for idx, match in enumerate(detalle):
+        if idx >= len(stats_list) or not stats_list[idx]:
+            continue
+        stat = stats_list[idx].get(stat_key, {})
+        side = "home" if match.get("local") else "away"
+        value = stat.get(side)
+        if isinstance(value, (int, float)):
+            values.append(value)
+    return _weighted_avg(values[:5]) if values else None
+
+
+def _apply_sofascore_features(features: dict, ss: dict):
+    """Usa SofaScore como fuente primaria cuando BSD no trae promedios suficientes."""
+    if not ss or not ss.get("disponible"):
+        return
+
+    local_perf = ss.get("form_performance_local", {})
+    visitor_perf = ss.get("form_performance_visitante", {})
+    if local_perf.get("forma_string"):
+        features["form_local_pts"] = _parse_form_string(local_perf.get("forma_string", ""))
+    if visitor_perf.get("forma_string"):
+        features["form_visitor_pts"] = _parse_form_string(visitor_perf.get("forma_string", ""))
+    features["xG_local"] = _first_number(features.get("xG_local"), local_perf.get("promedio_goles_favor"))
+    features["xG_visitor"] = _first_number(features.get("xG_visitor"), visitor_perf.get("promedio_goles_favor"))
+    features["xGc_local"] = _first_number(features.get("xGc_local"), local_perf.get("promedio_goles_contra"))
+    features["xGc_visitor"] = _first_number(features.get("xGc_visitor"), visitor_perf.get("promedio_goles_contra"))
+
+    sf_map = [
+        ("tiros_local_avg", "form_performance_local", "tiros_total"),
+        ("tiros_visitor_avg", "form_performance_visitante", "tiros_total"),
+        ("tiros_arco_local_avg", "form_performance_local", "tiros_arco"),
+        ("tiros_arco_visitor_avg", "form_performance_visitante", "tiros_arco"),
+        ("yc_local_avg", "form_performance_local", "amarillas"),
+        ("yc_visitor_avg", "form_performance_visitante", "amarillas"),
+        ("fouls_local_avg", "form_performance_local", "faltas"),
+        ("fouls_visitor_avg", "form_performance_visitante", "faltas"),
+    ]
+    for target, perf_key, stat_key in sf_map:
+        value = _sofascore_recent_avg(ss, perf_key, stat_key)
+        if value is not None:
+            features[target] = value
+
+    features["corners_local_avg"] = _sofascore_recent_avg(ss, "form_performance_local", "corners")
+    features["corners_visitor_avg"] = _sofascore_recent_avg(ss, "form_performance_visitante", "corners")
+
+    season_local = ss.get("team_stats_local", {})
+    season_visitor = ss.get("team_stats_visitante", {})
+    season_map = [
+        ("tiros_local_avg", _season_per_match(season_local, "shots")),
+        ("tiros_visitor_avg", _season_per_match(season_visitor, "shots")),
+        ("tiros_arco_local_avg", _season_per_match(season_local, "shots_on_target")),
+        ("tiros_arco_visitor_avg", _season_per_match(season_visitor, "shots_on_target")),
+        ("yc_local_avg", _season_per_match(season_local, "yellow_cards")),
+        ("yc_visitor_avg", _season_per_match(season_visitor, "yellow_cards")),
+        ("fouls_local_avg", _season_per_match(season_local, "fouls")),
+        ("fouls_visitor_avg", _season_per_match(season_visitor, "fouls")),
+        ("corners_local_avg", _season_per_match(season_local, "corners")),
+        ("corners_visitor_avg", _season_per_match(season_visitor, "corners")),
+    ]
+    for target, value in season_map:
+        if features.get(target) is None and isinstance(value, (int, float)):
+            features[target] = value
+
+
 def build_features(datos_resumidos: dict, prediccion_resumida: dict) -> dict:
     """
     Extrae y normaliza features de los datos existentes para
@@ -119,6 +209,7 @@ def build_features(datos_resumidos: dict, prediccion_resumida: dict) -> dict:
 
     # --- Alineaciones (SofaScore) ---
     ss = datos_resumidos.get("_sofascore", {})
+    _apply_sofascore_features(features, ss)
     lineups = ss.get("alineaciones", {})
     features["lineup_confirmed"] = 1 if lineups.get("local", {}).get("confirmada") else 0
 
@@ -214,10 +305,10 @@ def project_goals(features: dict, league_avg_goals: float = 2.65) -> Dict[str, f
 
 def project_tiros(features: dict) -> Dict[str, float]:
     """Proyecta tiros totales y al arco."""
-    t_loc = features.get("tiros_local_avg", 12.0)
-    t_vis = features.get("tiros_visitor_avg", 10.0)
-    ta_loc = features.get("tiros_arco_local_avg", 4.0)
-    ta_vis = features.get("tiros_arco_visitor_avg", 3.0)
+    t_loc = _num(features.get("tiros_local_avg"), 12.0)
+    t_vis = _num(features.get("tiros_visitor_avg"), 10.0)
+    ta_loc = _num(features.get("tiros_arco_local_avg"), 4.0)
+    ta_vis = _num(features.get("tiros_arco_visitor_avg"), 3.0)
 
     # Ajuste por posición y forma
     pos_adj = 0.0
@@ -239,14 +330,22 @@ def project_tiros(features: dict) -> Dict[str, float]:
 
 def project_corners(features: dict) -> Dict[str, float]:
     """Proyecta córners."""
-    # Heurística: más tiros + laterales ofensivos = más corners
-    t_total = (features.get("tiros_local_avg") or 12) + (features.get("tiros_visitor_avg") or 10)
-    base = t_total * 0.45  # ~45% de tiros generan corners en promedio
+    corners_loc = features.get("corners_local_avg")
+    corners_vis = features.get("corners_visitor_avg")
+    if corners_loc is not None and corners_vis is not None:
+        base = corners_loc + corners_vis
+    else:
+        # Heurística: más tiros + laterales ofensivos = más corners
+        t_total = (features.get("tiros_local_avg") or 12) + (features.get("tiros_visitor_avg") or 10)
+        base = t_total * 0.45  # ~45% de tiros generan corners en promedio
     form_adj = (features.get("form_local_pts", 1.5) + features.get("form_visitor_pts", 1.5) - 3.0) * 0.5
     derby_adj = 1.0 if features.get("is_derby") else 0.0
 
     total = max(5, base + form_adj + derby_adj)
-    loc_ratio = 0.55 if (features.get("home_position") or 10) < (features.get("away_position") or 10) else 0.5
+    if corners_loc is not None and corners_vis is not None and (corners_loc + corners_vis) > 0:
+        loc_ratio = corners_loc / (corners_loc + corners_vis)
+    else:
+        loc_ratio = 0.55 if (features.get("home_position") or 10) < (features.get("away_position") or 10) else 0.5
     return {
         "corners_local": round(total * loc_ratio, 1),
         "corners_visitor": round(total * (1 - loc_ratio), 1),
@@ -256,8 +355,8 @@ def project_corners(features: dict) -> Dict[str, float]:
 
 def project_cards(features: dict) -> Dict[str, float]:
     """Proyecta tarjetas amarillas."""
-    yc_loc = features.get("yc_local_avg", 1.8)
-    yc_vis = features.get("yc_visitor_avg", 1.8)
+    yc_loc = _num(features.get("yc_local_avg"), 1.8)
+    yc_vis = _num(features.get("yc_visitor_avg"), 1.8)
 
     derby_adj = 1.2 if features.get("is_derby") else 0.0
     form_adj = abs(features.get("form_local_pts", 1.5) - features.get("form_visitor_pts", 1.5)) * 0.2
@@ -273,8 +372,8 @@ def project_cards(features: dict) -> Dict[str, float]:
 
 def project_fouls(features: dict) -> Dict[str, float]:
     """Proyecta faltas totales."""
-    f_loc = features.get("fouls_local_avg", 12.0)
-    f_vis = features.get("fouls_visitor_avg", 12.0)
+    f_loc = _num(features.get("fouls_local_avg"), 12.0)
+    f_vis = _num(features.get("fouls_visitor_avg"), 12.0)
     derby_adj = 3.0 if features.get("is_derby") else 0.0
     return {
         "fouls": round(max(10, f_loc + f_vis + derby_adj), 1),

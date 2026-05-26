@@ -521,9 +521,18 @@ def resumir_standings_v2_para_prompt(v2_data: dict, home_id: int = None, away_id
     if not rows:
         return ""
 
+    def _first(row: dict, *keys, default=0):
+        for key in keys:
+            if row.get(key) is not None:
+                return row.get(key)
+        return default
+
     partes = ["\n### TABLA DE POSICIONES (BSD v2) - con xG"]
-    partes.append(f"{'#':>3} {'Equipo':<24} {'PJ':>3} {'Pts':>4} {'GF':>3} {'GA':>3} {'xGF':>6} {'xGA':>6} {'xGD':>6} {'Forma':>6}")
-    partes.append("-" * 85)
+    partes.append(
+        f"{'#':>3} {'Equipo':<24} {'PJ':>3} {'V':>2} {'E':>2} {'D':>2} "
+        f"{'Pts':>4} {'GF':>3} {'GC':>3} {'DG':>4} {'xGF':>6} {'xGA':>6} {'xGD':>6} {'Forma':>6}"
+    )
+    partes.append("-" * 104)
 
     destacados = set()
     if home_id:
@@ -534,13 +543,20 @@ def resumir_standings_v2_para_prompt(v2_data: dict, home_id: int = None, away_id
     for row in rows[:20]:
         tid = row.get("team_id")
         marker = ">" if tid in destacados else " "
+        gf = _first(row, "gf", "goals_for")
+        ga = _first(row, "ga", "goals_against")
+        gd = _first(row, "gd", "goal_difference", default=(gf or 0) - (ga or 0))
         partes.append(
             f"{marker}{row.get('position', '?'):>2} "
             f"{row.get('team_name', '?'):<24} "
-            f"{row.get('played', 0):>3} "
-            f"{row.get('pts', 0):>4} "
-            f"{row.get('gf', 0):>3} "
-            f"{row.get('ga', 0):>3} "
+            f"{_first(row, 'played', 'matches'):>3} "
+            f"{_first(row, 'wins', 'won'):>2} "
+            f"{_first(row, 'draws', 'drawn'):>2} "
+            f"{_first(row, 'losses', 'lost'):>2} "
+            f"{_first(row, 'pts', 'points'):>4} "
+            f"{gf:>3} "
+            f"{ga:>3} "
+            f"{gd:>4} "
             f"{row.get('xgf', 0) or 0:>6.1f} "
             f"{row.get('xga', 0) or 0:>6.1f} "
             f"{row.get('xgd', 0) or 0:>6.1f} "
@@ -607,9 +623,17 @@ def resumir_arbitro_v2_para_prompt(datos_resumidos: dict) -> str:
     if not arb:
         return "\n### ARBITRO\nNo asignado aun."
 
-    partes = [f"\n### ARBITRO (BSD v2): {arb.get('nombre', '?')}"]
+    fuente = arb.get("_fuente_yc") or "BSD v2"
+    partes = [f"\n### ARBITRO ({fuente}): {arb.get('nombre', '?')}"]
     if arb.get("nacionalidad"):
         partes.append(f"- Nacionalidad: {arb.get('nacionalidad')}")
+    comp = arb.get("_sofascore_competicion")
+    if comp:
+        partes.append(
+            f"- Competición actual ({comp.get('nombre', '?')}): "
+            f"{comp.get('partidos', '?')} part, {comp.get('yc_pp', '?')} YC/part, "
+            f"{comp.get('rc_pp', '?')} RC/part"
+        )
     if arb.get("matches"):
         partes.append(f"- Partidos dirigidos: {arb.get('matches')}")
     if arb.get("avg_yellow_per_match") is not None:
@@ -620,6 +644,23 @@ def resumir_arbitro_v2_para_prompt(datos_resumidos: dict) -> str:
         partes.append(f"- Faltas/partido: {arb.get('avg_fouls_per_match')}")
     if arb.get("avg_goals_per_match") is not None:
         partes.append(f"- Goles/partido: {arb.get('avg_goals_per_match')}")
+
+    ref_data = arb.get("_sofascore_ref") or {}
+    torneos = ref_data.get("torneos", []) if isinstance(ref_data, dict) else []
+    if torneos:
+        partes.append("- Promedios por competición:")
+        for t in torneos[:8]:
+            tn = t.get("nombre", "?")
+            apps = t.get("partidos")
+            yc = t.get("yc_pp", "?")
+            rc = t.get("rc_pp", "?")
+            pen = t.get("penaltis")
+            detalle = f"{yc} YC/part, {rc} RC/part"
+            if apps is not None:
+                detalle = f"{apps} part, {detalle}"
+            if pen is not None:
+                detalle += f", {pen} pen"
+            partes.append(f"    {tn}: {detalle}")
     return "\n".join(partes)
 
 
