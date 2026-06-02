@@ -327,6 +327,79 @@ def obtener_team_season_stats(session, team_id: int, tournament_uid: int, season
         return None
 
 
+def obtener_player_profile(session, player_id: int) -> dict | None:
+    """Obtiene perfil base de jugador desde SofaScore."""
+    if not player_id:
+        return None
+    try:
+        resp = session.get(f"{SOFASCORE_API}/player/{player_id}", timeout=12)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if data else None
+    except Exception:
+        return None
+
+
+def obtener_player_recent_events(session, player_id: int) -> dict | None:
+    """Obtiene partidos recientes de jugador con minutos/rating/banca."""
+    if not player_id:
+        return None
+    try:
+        resp = session.get(f"{SOFASCORE_API}/player/{player_id}/events/last/0", timeout=15)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if data else None
+    except Exception:
+        return None
+
+
+def obtener_player_season_stats(session, player_id: int, tournament_uid: int, season_id: int, split: str = "overall") -> dict | None:
+    """Obtiene estadisticas del jugador para torneo/temporada actual."""
+    if not player_id or not tournament_uid or not season_id:
+        return None
+    try:
+        resp = session.get(
+            f"{SOFASCORE_API}/player/{player_id}/unique-tournament/{tournament_uid}/season/{season_id}/statistics/{split}",
+            timeout=12,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if data else None
+    except Exception:
+        return None
+
+
+def obtener_player_characteristics(session, player_id: int) -> dict | None:
+    """Obtiene fortalezas/debilidades codificadas y posiciones del jugador."""
+    if not player_id:
+        return None
+    try:
+        resp = session.get(f"{SOFASCORE_API}/player/{player_id}/characteristics", timeout=12)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if data else None
+    except Exception:
+        return None
+
+
+def obtener_player_attribute_overviews(session, player_id: int) -> dict | None:
+    """Obtiene radar de atributos del jugador cuando SofaScore lo ofrece."""
+    if not player_id:
+        return None
+    try:
+        resp = session.get(f"{SOFASCORE_API}/player/{player_id}/attribute-overviews", timeout=12)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if data else None
+    except Exception:
+        return None
+
+
 def obtener_estadisticas_evento(session, event_id: int) -> dict | None:
     """Obtiene estadisticas detalladas del partido (por periodo)."""
     url = f"{SOFASCORE_API}/event/{event_id}/statistics"
@@ -905,10 +978,17 @@ def _extraer_info_alineacion(lineups_data: dict, side: str) -> dict:
         jersey = player_info.get("jerseyNumber", "?")
         es_suplente = p.get("substitute", False)
         entry = {
+            "player_id": player_info.get("id"),
             "nombre": nombre,
             "posicion": posicion,
             "dorsal": jersey,
         }
+        valor_mercado = _extraer_valor_mercado_sofascore(player_info)
+        edad = _extraer_edad_sofascore(player_info)
+        if valor_mercado:
+            entry["valor_mercado"] = valor_mercado
+        if edad:
+            entry["edad"] = edad
         if es_suplente:
             suplentes.append(entry)
         else:
@@ -935,12 +1015,19 @@ def _extraer_missing_players_sofascore(missing_players: list) -> dict:
         desc = item.get("description") or ""
         estado = _estado_missing_player(item)
         entry = {
+            "player_id": player.get("id"),
             "nombre": player.get("name") or player.get("shortName") or "?",
             "posicion": player.get("position", "?"),
             "dorsal": player.get("jerseyNumber", "?"),
             "estado": estado,
             "motivo": desc or _motivo_missing_player(item),
         }
+        valor_mercado = _extraer_valor_mercado_sofascore(player)
+        edad = _extraer_edad_sofascore(player)
+        if valor_mercado:
+            entry["valor_mercado"] = valor_mercado
+        if edad:
+            entry["edad"] = edad
         if item.get("expectedEndDate"):
             entry["fecha_fin_estimada"] = item["expectedEndDate"][:10]
 
@@ -950,6 +1037,93 @@ def _extraer_missing_players_sofascore(missing_players: list) -> dict:
             bajas["confirmadas"].append(entry)
 
     return bajas
+
+
+def _extraer_valor_mercado_sofascore(player: dict) -> str | None:
+    """Extrae valor de mercado si SofaScore lo incluye en el objeto player."""
+    if not player:
+        return None
+
+    raw = player.get("proposedMarketValueRaw") or player.get("marketValueRaw")
+    currency = player.get("marketValueCurrency")
+    if isinstance(raw, dict):
+        currency = raw.get("currency") or currency
+        formatted = _formatear_valor_mercado(raw.get("value"), currency)
+        if formatted:
+            return formatted
+
+    for key in ("proposedMarketValue", "marketValue"):
+        value = player.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        formatted = _formatear_valor_mercado(value, currency)
+        if formatted:
+            return formatted
+
+    return None
+
+
+def _formatear_valor_mercado(value, currency: str | None = None) -> str | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    suffix = f" {currency}" if currency else ""
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:.1f}M{suffix}"
+    if number >= 1_000:
+        return f"{number / 1_000:.0f}k{suffix}"
+    return f"{number:.0f}{suffix}"
+
+
+def _extraer_edad_sofascore(player: dict) -> int | None:
+    dob_ts = player.get("dateOfBirthTimestamp") if player else None
+    if not dob_ts:
+        return None
+    try:
+        born = datetime.fromtimestamp(int(dob_ts), tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+    today = datetime.now(timezone.utc)
+    return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+
+
+def _to_float_or_none(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int_or_zero(value) -> int:
+    number = _to_float_or_none(value)
+    return int(number) if number is not None else 0
+
+
+def _extraer_valor_mercado_num_sofascore(player: dict) -> float | None:
+    if not player:
+        return None
+    raw = player.get("proposedMarketValueRaw") or player.get("marketValueRaw")
+    if isinstance(raw, dict):
+        value = _to_float_or_none(raw.get("value"))
+        if value is not None:
+            return value
+    for key in ("proposedMarketValue", "marketValue"):
+        value = _to_float_or_none(player.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _formatear_ratio_90(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return f"{value:.2f}/90"
 
 
 def _estado_missing_player(item: dict) -> str:
@@ -972,6 +1146,345 @@ def _motivo_missing_player(item: dict) -> str:
     if estado in {"injured", "doubtful"}:
         return "Injury"
     return "No disponible"
+
+
+def _enriquecer_impacto_bajas_sofascore(session, alineaciones: dict, tournament_uid: int | None, season_id: int | None) -> None:
+    """Agrega impacto estimado a las bajas de SofaScore in-place."""
+    refs = []
+    for side in ("local", "visitante"):
+        bajas = ((alineaciones.get(side) or {}).get("bajas") or {})
+        for bucket in ("confirmadas", "dudas"):
+            for baja in bajas.get(bucket, []) or []:
+                if baja.get("player_id"):
+                    refs.append(baja)
+
+    if not refs:
+        return
+
+    def _fetch(baja: dict) -> tuple[dict, dict | None]:
+        return baja, _calcular_impacto_baja_sofascore(session, baja, tournament_uid, season_id)
+
+    max_workers = min(5, max(1, len(refs)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_fetch, baja) for baja in refs[:18]]
+        for future in as_completed(futures):
+            try:
+                baja, impacto = future.result()
+            except Exception:
+                continue
+            if impacto:
+                baja["impacto_baja"] = impacto
+
+
+def _enriquecer_impacto_xi_sofascore(session, alineaciones: dict, tournament_uid: int | None, season_id: int | None) -> None:
+    """Agrega impacto estimado a titulares probables/confirmados de SofaScore in-place."""
+    refs = []
+    for side in ("local", "visitante"):
+        for jugador in (alineaciones.get(side) or {}).get("titulares", []) or []:
+            if jugador.get("player_id"):
+                refs.append(jugador)
+
+    if not refs:
+        return
+
+    def _fetch(jugador: dict) -> tuple[dict, dict | None]:
+        return jugador, _calcular_impacto_baja_sofascore(
+            session,
+            jugador,
+            tournament_uid,
+            season_id,
+            include_traits=False,
+        )
+
+    # Solo titulares: maximo 22 perfiles. Threads moderados para no castigar la API.
+    max_workers = min(6, max(1, len(refs)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_fetch, jugador) for jugador in refs[:22]]
+        for future in as_completed(futures):
+            try:
+                jugador, impacto = future.result()
+            except Exception:
+                continue
+            if impacto:
+                jugador["impacto_jugador"] = impacto
+
+
+def _calcular_impacto_baja_sofascore(
+    session,
+    baja: dict,
+    tournament_uid: int | None,
+    season_id: int | None,
+    include_traits: bool = True,
+) -> dict | None:
+    player_id = baja.get("player_id")
+    if not player_id:
+        return None
+
+    profile_data = obtener_player_profile(session, player_id) or {}
+    profile = profile_data.get("player", {}) if isinstance(profile_data, dict) else {}
+    if profile:
+        if not baja.get("valor_mercado"):
+            valor = _extraer_valor_mercado_sofascore(profile)
+            if valor:
+                baja["valor_mercado"] = valor
+        if not baja.get("edad"):
+            edad = _extraer_edad_sofascore(profile)
+            if edad:
+                baja["edad"] = edad
+        if not baja.get("posicion") or baja.get("posicion") == "?":
+            baja["posicion"] = profile.get("position", "?")
+        if not baja.get("dorsal") or baja.get("dorsal") == "?":
+            baja["dorsal"] = profile.get("jerseyNumber") or profile.get("shirtNumber") or "?"
+
+    events_data = obtener_player_recent_events(session, player_id) or {}
+    current_stats_data = obtener_player_season_stats(session, player_id, tournament_uid, season_id) or {}
+    characteristics = obtener_player_characteristics(session, player_id) or {} if include_traits else {}
+    attrs = obtener_player_attribute_overviews(session, player_id) or {} if include_traits else {}
+
+    recent = _resumir_recent_events_jugador(events_data)
+    stats = (current_stats_data.get("statistics") or {}) if isinstance(current_stats_data, dict) else {}
+    return _score_impacto_baja_sofascore(baja, profile, recent, stats, characteristics, attrs)
+
+
+def _resumir_recent_events_jugador(events_data: dict, max_events: int = 10) -> dict:
+    events = events_data.get("events", []) if isinstance(events_data, dict) else []
+    stats_map = events_data.get("statisticsMap", {}) if isinstance(events_data, dict) else {}
+    bench_map = events_data.get("onBenchMap", {}) if isinstance(events_data, dict) else {}
+    incidents_map = events_data.get("incidentsMap", {}) if isinstance(events_data, dict) else {}
+
+    rows = []
+    for event in events:
+        event_id = str(event.get("id"))
+        status = event.get("status", {}) or {}
+        status_type = status.get("type")
+        status_desc = status.get("description")
+        stat = stats_map.get(event_id) or {}
+        on_bench = bool(bench_map.get(event_id))
+        if status_type != "finished" and status_desc not in {"Ended", "AP", "AET"} and not stat and not on_bench:
+            continue
+        rows.append({
+            "timestamp": event.get("startTimestamp") or 0,
+            "minutes": _to_int_or_zero(stat.get("minutesPlayed")),
+            "rating": _to_float_or_none(stat.get("rating")),
+            "on_bench": on_bench,
+            "incidents": incidents_map.get(event_id) or {},
+        })
+
+    rows.sort(key=lambda row: row.get("timestamp") or 0, reverse=True)
+    rows = rows[:max_events]
+    appearances = [r for r in rows if (r.get("minutes") or 0) > 0]
+    ratings = [r["rating"] for r in rows if r.get("rating") is not None]
+    starts_like = [r for r in appearances if (r.get("minutes") or 0) >= 60]
+    bench_only = [r for r in rows if r.get("on_bench") and not r.get("minutes")]
+    goals = sum(_to_int_or_zero((r.get("incidents") or {}).get("goals")) for r in rows)
+    assists = sum(_to_int_or_zero((r.get("incidents") or {}).get("assists")) for r in rows)
+    yellow_cards = sum(_to_int_or_zero((r.get("incidents") or {}).get("yellowCards")) for r in rows)
+    minutes_total = sum(r.get("minutes") or 0 for r in rows)
+
+    return {
+        "sample": len(rows),
+        "appearances": len(appearances),
+        "starts_like": len(starts_like),
+        "bench_only": len(bench_only),
+        "minutes_total": minutes_total,
+        "avg_minutes_all": round(minutes_total / len(rows), 1) if rows else None,
+        "avg_minutes_apps": round(minutes_total / len(appearances), 1) if appearances else None,
+        "avg_rating": round(sum(ratings) / len(ratings), 2) if ratings else None,
+        "goals": goals,
+        "assists": assists,
+        "yellow_cards": yellow_cards,
+    }
+
+
+def _score_impacto_baja_sofascore(
+    baja: dict,
+    profile: dict,
+    recent: dict,
+    stats: dict,
+    characteristics: dict,
+    attrs: dict,
+) -> dict:
+    score = 0.0
+    razones = []
+    posicion = (baja.get("posicion") or profile.get("position") or "").upper()
+    market_value = _extraer_valor_mercado_num_sofascore(profile)
+
+    recent_sample = recent.get("sample") or 0
+    recent_apps = recent.get("appearances") or 0
+    recent_starts = recent.get("starts_like") or 0
+    recent_bench = recent.get("bench_only") or 0
+    recent_avg_minutes = recent.get("avg_minutes_apps")
+    recent_rating = recent.get("avg_rating")
+
+    if recent_apps >= 8:
+        score += 2.2
+    elif recent_apps >= 5:
+        score += 1.5
+    elif recent_apps >= 3:
+        score += 0.8
+    elif recent_apps >= 1:
+        score += 0.3
+
+    if recent_avg_minutes is not None:
+        if recent_avg_minutes >= 75:
+            score += 1.5
+        elif recent_avg_minutes >= 45:
+            score += 1.0
+        elif recent_avg_minutes >= 20:
+            score += 0.4
+
+    if recent_starts >= 5:
+        score += 1.2
+    elif recent_starts >= 2:
+        score += 0.6
+
+    if recent_sample >= 4 and recent_apps == 0 and recent_bench >= 4:
+        score -= 1.4
+        razones.append(f"suplente habitual: 0/{recent_sample} apariciones recientes")
+    elif recent_sample:
+        razones.append(f"uso reciente: {recent_apps}/{recent_sample} PJ, {recent_avg_minutes or 0} min/prom")
+
+    minutes = _to_int_or_zero(stats.get("minutesPlayed"))
+    count_rating = _to_int_or_zero(stats.get("countRating"))
+    rating = _to_float_or_none(stats.get("rating"))
+    if minutes >= 900:
+        score += 2.5
+    elif minutes >= 600:
+        score += 1.8
+    elif minutes >= 300:
+        score += 1.1
+    elif minutes >= 120:
+        score += 0.6
+
+    if count_rating >= 10:
+        score += 1.0
+    elif count_rating >= 5:
+        score += 0.6
+    elif count_rating >= 2:
+        score += 0.3
+
+    if minutes:
+        razones.append(f"temporada actual: {minutes} min, {count_rating} PJ rating")
+
+    effective_rating = rating if rating is not None else recent_rating
+    if effective_rating is not None:
+        if effective_rating >= 7.1:
+            score += 0.8
+        elif effective_rating >= 6.8:
+            score += 0.4
+        elif effective_rating < 6.35:
+            score -= 0.3
+        razones.append(f"rating {effective_rating:.2f}")
+
+    if market_value is not None:
+        if market_value >= 15_000_000:
+            score += 1.2
+        elif market_value >= 5_000_000:
+            score += 0.8
+        elif market_value >= 1_000_000:
+            score += 0.4
+        raw_market = profile.get("proposedMarketValueRaw") or profile.get("marketValueRaw") or {}
+        currency = raw_market.get("currency") if isinstance(raw_market, dict) else profile.get("marketValueCurrency")
+        razones.append(f"valor {_formatear_valor_mercado(market_value, currency)}")
+
+    minutes_base = max(minutes, recent.get("minutes_total") or 0)
+    per90 = lambda value: (_to_float_or_none(value) or 0.0) * 90 / minutes_base if minutes_base else None
+    goals = _to_int_or_zero(stats.get("goals"))
+    assists = _to_int_or_zero(stats.get("assists") or stats.get("goalAssist"))
+    shots90 = per90(stats.get("totalShots"))
+    sot90 = per90(stats.get("shotsOnTarget") or stats.get("onTargetScoringAttempt"))
+    xg90 = per90(stats.get("expectedGoals"))
+    xa90 = per90(stats.get("expectedAssists"))
+    key90 = per90(stats.get("keyPasses") or stats.get("keyPass"))
+    crosses90 = per90(stats.get("accurateCrosses") or stats.get("accurateCross"))
+    defensive90 = per90((_to_float_or_none(stats.get("tackles")) or 0) + (_to_float_or_none(stats.get("interceptions")) or 0))
+    saves90 = per90(stats.get("saves"))
+
+    if posicion in {"F", "FW"}:
+        if (xg90 is not None and xg90 >= 0.25) or (shots90 is not None and shots90 >= 2.0):
+            score += 1.0
+            razones.append(f"amenaza ofensiva {(_formatear_ratio_90(xg90) or _formatear_ratio_90(shots90))}")
+        if goals + assists >= 3:
+            score += 0.8
+            razones.append(f"G+A {goals + assists}")
+    elif posicion in {"M", "AM", "DM"}:
+        if (key90 is not None and key90 >= 1.2) or (xa90 is not None and xa90 >= 0.12):
+            score += 1.0
+            razones.append(f"creacion {(_formatear_ratio_90(key90) or _formatear_ratio_90(xa90))}")
+    elif posicion == "D":
+        if defensive90 is not None and defensive90 >= 2.0:
+            score += 0.6
+            razones.append(f"duelo/defensa {_formatear_ratio_90(defensive90)}")
+        if crosses90 is not None and crosses90 >= 0.8:
+            score += 0.4
+            razones.append(f"centros {_formatear_ratio_90(crosses90)}")
+    elif posicion == "G":
+        if minutes >= 450 or (recent_starts >= 5 and recent_avg_minutes and recent_avg_minutes >= 80):
+            score += 1.2
+            razones.append("portero de uso alto")
+        if saves90 is not None and saves90 >= 2.5:
+            score += 0.4
+            razones.append(f"atajadas {_formatear_ratio_90(saves90)}")
+
+    attr_reason = _resumir_attribute_edge(attrs)
+    if attr_reason:
+        score += 0.3
+        razones.append(attr_reason)
+
+    char_positions = characteristics.get("positions") if isinstance(characteristics, dict) else None
+    if char_positions and not posicion:
+        razones.append(f"rol {','.join(char_positions[:2])}")
+
+    if recent_sample == 0 and minutes == 0:
+        nivel = "DESCONOCIDA"
+        if market_value and market_value >= 5_000_000:
+            razones.append("valor alto, pero sin evidencia reciente de minutos")
+        elif not razones:
+            razones.append("sin minutos/stats recientes suficientes")
+    elif score >= 5.0:
+        nivel = "ALTA"
+    elif score >= 3.0:
+        nivel = "MEDIA"
+    else:
+        nivel = "BAJA"
+
+    # Mantener el prompt compacto y accionable.
+    razones = [r for r in razones if r][:4]
+    return {
+        "nivel": nivel,
+        "score": round(score, 1),
+        "razones": razones,
+    }
+
+
+def _resumir_attribute_edge(attrs: dict) -> str | None:
+    if not isinstance(attrs, dict):
+        return None
+    player_attrs = (attrs.get("playerAttributeOverviews") or [])
+    avg_attrs = (attrs.get("averageAttributeOverviews") or [])
+    if not player_attrs or not avg_attrs:
+        return None
+    player = player_attrs[0] or {}
+    avg = avg_attrs[0] or {}
+    diffs = []
+    for key, label in [
+        ("attacking", "ATT"),
+        ("technical", "TEC"),
+        ("tactical", "TAC"),
+        ("defending", "DEF"),
+        ("creativity", "CRE"),
+    ]:
+        p_val = _to_float_or_none(player.get(key))
+        a_val = _to_float_or_none(avg.get(key))
+        if p_val is not None and a_val is not None:
+            diffs.append((p_val - a_val, label))
+    if not diffs:
+        return None
+    best_diff, label = max(diffs, key=lambda x: abs(x[0]))
+    if abs(best_diff) < 6:
+        return None
+    sign = "+" if best_diff > 0 else ""
+    return f"atributo {label} {sign}{best_diff:.0f} vs media pos."
 
 
 def enriquecer_datos_partido(datos_bsd: dict) -> dict:
@@ -1143,6 +1656,26 @@ def enriquecer_datos_partido(datos_bsd: dict) -> dict:
                 except Exception:
                     pass
 
+        if enriquecido.get("alineaciones"):
+            try:
+                _enriquecer_impacto_bajas_sofascore(
+                    session,
+                    enriquecido["alineaciones"],
+                    tournament_uid,
+                    season_id,
+                )
+            except Exception:
+                pass
+            try:
+                _enriquecer_impacto_xi_sofascore(
+                    session,
+                    enriquecido["alineaciones"],
+                    tournament_uid,
+                    season_id,
+                )
+            except Exception:
+                pass
+
     # Enriquecer arbitro desde API de SofaScore (stats por torneo)
     detalle_ev = enriquecido.get("detalle_evento", {})
     arb_ss = detalle_ev.get("arbitro", {}) if isinstance(detalle_ev, dict) else {}
@@ -1194,6 +1727,14 @@ def _formatear_form_performance_para_prompt(datos: dict) -> str:
     away_team = datos.get("partido", "").split(" vs ")[1] if " vs " in datos.get("partido", "") else "Visitante"
 
     partes = ["\n### FORMA RECIENTE (SofaScore Performance)"]
+
+    def _num_stat(value):
+        try:
+            parsed = float(str(value).replace(",", "."))
+            return int(parsed) if parsed.is_integer() else parsed
+        except (TypeError, ValueError):
+            return 0
+
     # Detectar el torneo actual del partido que se analiza
     torneo_actual = sofas.get("torneo", "")
     for equipo, key in [(local_team, "form_performance_local"), (away_team, "form_performance_visitante")]:
@@ -1223,14 +1764,14 @@ def _formatear_form_performance_para_prompt(datos: dict) -> str:
                 if tn != torneo_actual:
                     orden.append(tn)
 
-            for tn in orden[:2]:
+            for tn in orden[:3]:
                 matches = torneos[tn]
                 es_copa = any(w in tn.lower() for w in ["copa", "libertadores", "champions", "sudamericana", "concacaf", "europa", "uefa"])
                 label = "Copa/Torneo" if es_copa else "Liga"
                 # Para copa/torneo: mostrar TODOS los partidos de esta temporada
-                # Para liga: solo ultimos 5
+                # Para liga: ampliar muestra sin volver enorme el prompt
                 if not es_copa:
-                    matches = matches[:5]
+                    matches = matches[:8]
                 partes.append(f"  Ultimos en {label} ({tn}):")
                 for m in matches:
                     idx = next((i for i, d in enumerate(detalle) if d.get("event_id") == m.get("event_id")), -1)
@@ -1238,14 +1779,16 @@ def _formatear_form_performance_para_prompt(datos: dict) -> str:
                     linea = f"    vs {m.get('rival', '?')} ({loc}): {m.get('gf', 0)}-{m.get('gc', 0)}"
                     st = stats_list[idx] if 0 <= idx < len(stats_list) and stats_list[idx] else None
                     if st:
-                        th = st.get("tiros_total", {}).get("home", 0)
-                        ta = st.get("tiros_total", {}).get("away", 0)
-                        ah = st.get("tiros_arco", {}).get("home", 0)
-                        aa = st.get("tiros_arco", {}).get("away", 0)
-                        yh = st.get("amarillas", {}).get("home", 0)
-                        ya = st.get("amarillas", {}).get("away", 0)
-                        ch = st.get("corners", {}).get("home", 0)
-                        ca = st.get("corners", {}).get("away", 0)
+                        th = _num_stat(st.get("tiros_total", {}).get("home", 0))
+                        ta = _num_stat(st.get("tiros_total", {}).get("away", 0))
+                        ah = _num_stat(st.get("tiros_arco", {}).get("home", 0))
+                        aa = _num_stat(st.get("tiros_arco", {}).get("away", 0))
+                        yh = _num_stat(st.get("amarillas", {}).get("home", 0))
+                        ya = _num_stat(st.get("amarillas", {}).get("away", 0))
+                        ch = _num_stat(st.get("corners", {}).get("home", 0))
+                        ca = _num_stat(st.get("corners", {}).get("away", 0))
+                        fh = _num_stat(st.get("faltas", {}).get("home", 0))
+                        fa = _num_stat(st.get("faltas", {}).get("away", 0))
                         extras = []
                         if th or ta:
                             extras.append(f"Tiros: {th}-{ta}")
@@ -1255,6 +1798,8 @@ def _formatear_form_performance_para_prompt(datos: dict) -> str:
                             extras.append(f"YC: {yh}-{ya}")
                         if ch or ca:
                             extras.append(f"Corners: {ch}-{ca}")
+                        if fh or fa:
+                            extras.append(f"Faltas: {fh}-{fa} (Tot {fh + fa})")
                         if extras:
                             linea += " | " + " | ".join(extras)
                     partes.append(linea)
@@ -1421,13 +1966,15 @@ def _formatear_alineaciones_para_prompt(datos: dict) -> str:
             for baja in confirmadas:
                 motivo = f" - {baja.get('motivo')}" if baja.get("motivo") else ""
                 fecha = f" (fin est.: {baja.get('fecha_fin_estimada')})" if baja.get("fecha_fin_estimada") else ""
-                partes.append(f"    - {baja.get('nombre', '?')} ({baja.get('posicion', '?')}): {baja.get('estado', '?')}{motivo}{fecha}")
+                extra = _formatear_extra_baja_sofascore(baja)
+                partes.append(f"    - {baja.get('nombre', '?')} ({baja.get('posicion', '?')}): {baja.get('estado', '?')}{motivo}{fecha}{extra}")
         if dudas:
             partes.append("  Dudas SofaScore:")
             for baja in dudas:
                 motivo = f" - {baja.get('motivo')}" if baja.get("motivo") else ""
                 fecha = f" (fin est.: {baja.get('fecha_fin_estimada')})" if baja.get("fecha_fin_estimada") else ""
-                partes.append(f"    - {baja.get('nombre', '?')} ({baja.get('posicion', '?')}): {baja.get('estado', '?')}{motivo}{fecha}")
+                extra = _formatear_extra_baja_sofascore(baja)
+                partes.append(f"    - {baja.get('nombre', '?')} ({baja.get('posicion', '?')}): {baja.get('estado', '?')}{motivo}{fecha}{extra}")
 
     partes.append("\nIMPORTANTE: Si la alineacion es CONFIRMADA, los titulares/suplentes listados por SofaScore son los disponibles para jugar. Si es PRELIMINAR/POSIBLE, usalos solo como probable XI. Los jugadores en 'No disponibles SofaScore' NO deben contarse como disponibles; las 'Dudas' tienen disponibilidad incierta.")
     return "\n".join(partes)
@@ -1456,13 +2003,15 @@ def _formatear_bajas_sofascore_para_prompt(datos: dict) -> str:
             for baja in confirmadas:
                 motivo = f" - {baja.get('motivo')}" if baja.get("motivo") else ""
                 fecha = f" (fin est.: {baja.get('fecha_fin_estimada')})" if baja.get("fecha_fin_estimada") else ""
-                partes.append(f"  - {baja.get('nombre', '?')} ({baja.get('posicion', '?')}): {baja.get('estado', '?')}{motivo}{fecha}")
+                extra = _formatear_extra_baja_sofascore(baja)
+                partes.append(f"  - {baja.get('nombre', '?')} ({baja.get('posicion', '?')}): {baja.get('estado', '?')}{motivo}{fecha}{extra}")
         if dudas:
             partes.append("Dudas:")
             for baja in dudas:
                 motivo = f" - {baja.get('motivo')}" if baja.get("motivo") else ""
                 fecha = f" (fin est.: {baja.get('fecha_fin_estimada')})" if baja.get("fecha_fin_estimada") else ""
-                partes.append(f"  - {baja.get('nombre', '?')} ({baja.get('posicion', '?')}): {baja.get('estado', '?')}{motivo}{fecha}")
+                extra = _formatear_extra_baja_sofascore(baja)
+                partes.append(f"  - {baja.get('nombre', '?')} ({baja.get('posicion', '?')}): {baja.get('estado', '?')}{motivo}{fecha}{extra}")
 
     if not partes:
         return "(SofaScore no lista bajas/dudas en lineups para este partido.)"
@@ -1472,6 +2021,102 @@ def _formatear_bajas_sofascore_para_prompt(datos: dict) -> str:
         "Usa estas bajas/dudas por encima de BSD. Si la alineación está confirmada, titulares/suplentes de SofaScore juegan; si está preliminar, trátalos como probable XI.",
         *partes,
     ])
+
+
+def _formatear_xi_impact_sofascore_para_prompt(datos: dict) -> str:
+    """Resume peso interno de titulares probables/confirmados sin inflar el prompt."""
+    sofas = datos.get("_sofascore", {})
+    alin = sofas.get("alineaciones", {}) if sofas.get("disponible") else {}
+    if not alin:
+        return ""
+
+    local_team = datos.get("partido", "").split(" vs ")[0] if " vs " in datos.get("partido", "") else "Local"
+    away_team = datos.get("partido", "").split(" vs ")[1] if " vs " in datos.get("partido", "") else "Visitante"
+
+    partes = ["\n### IMPACTO XI SOFASCORE (quienes SI juegan)"]
+    partes.append(
+        "Uso: media reciente/temporada de titulares probables o confirmados. "
+        "Mide peso interno/continuidad dentro del equipo, NO calidad absoluta entre equipos. "
+        "Si la alineación es preliminar, úsalo solo como perfil probable."
+    )
+
+    any_content = False
+    for side, team_name in [("local", local_team), ("visitante", away_team)]:
+        team = alin.get(side, {}) or {}
+        starters = [p for p in team.get("titulares", []) or [] if p.get("impacto_jugador")]
+        if not starters:
+            continue
+        any_content = True
+        confirmed = "confirmado" if team.get("confirmada") else "probable"
+        levels = {"ALTA": 0, "MEDIA": 0, "BAJA": 0, "DESCONOCIDA": 0}
+        scores = []
+        for p in starters:
+            impacto = p.get("impacto_jugador") or {}
+            levels[impacto.get("nivel", "DESCONOCIDA")] = levels.get(impacto.get("nivel", "DESCONOCIDA"), 0) + 1
+            if impacto.get("score") is not None:
+                scores.append(float(impacto["score"]))
+        avg_score = round(sum(scores) / len(scores), 1) if scores else "?"
+        partes.append(
+            f"\n**{team_name}** ({confirmed}) | datos XI: {len(starters)}/11 | "
+            f"peso interno A/M/B/D: {levels.get('ALTA',0)}/{levels.get('MEDIA',0)}/{levels.get('BAJA',0)}/{levels.get('DESCONOCIDA',0)} | peso prom {avg_score}"
+        )
+
+        top = sorted(starters, key=lambda p: (p.get("impacto_jugador") or {}).get("score", -99), reverse=True)[:4]
+        if top:
+            partes.append("  Titulares con mayor peso interno:")
+            for p in top:
+                partes.append(f"    - {_linea_impacto_jugador_sofascore(p)}")
+
+        gk = next((p for p in starters if (p.get("posicion") or "").upper() == "G"), None)
+        weak = [
+            p for p in starters
+            if (p.get("impacto_jugador") or {}).get("nivel") in {"BAJA", "DESCONOCIDA"}
+            and p is not gk
+        ][:3]
+        alertas = []
+        if gk:
+            alertas.append(f"Portero: {_linea_impacto_jugador_sofascore(gk, compact=True)}")
+        if len(weak) >= 2:
+            alertas.append("XI con varios perfiles de bajo peso: " + ", ".join(
+                f"{p.get('nombre','?')} {((p.get('impacto_jugador') or {}).get('nivel','?'))}"
+                for p in weak
+            ))
+        if alertas:
+            partes.append("  Alertas:")
+            partes.extend(f"    - {a}" for a in alertas[:3])
+
+    return "\n".join(partes) if any_content else ""
+
+
+def _linea_impacto_jugador_sofascore(player: dict, compact: bool = False) -> str:
+    impacto = player.get("impacto_jugador") or {}
+    nivel = impacto.get("nivel", "DESCONOCIDA")
+    score = impacto.get("score")
+    score_txt = f" {score}" if score is not None else ""
+    base = f"{player.get('nombre', '?')} ({player.get('posicion', '?')}) peso interno {nivel}{score_txt}"
+    extras = []
+    if player.get("valor_mercado") and not compact:
+        extras.append(f"valor {player['valor_mercado']}")
+    razones = impacto.get("razones") or []
+    extras.extend(razones[:1 if compact else 2])
+    return base + (": " + "; ".join(extras) if extras else "")
+
+
+def _formatear_extra_baja_sofascore(baja: dict) -> str:
+    detalles = []
+    if baja.get("valor_mercado"):
+        detalles.append(f"valor {baja['valor_mercado']}")
+    if baja.get("edad"):
+        detalles.append(f"edad {baja['edad']}")
+    impacto = baja.get("impacto_baja") or {}
+    if impacto:
+        razones = impacto.get("razones") or []
+        razon_txt = "; ".join(razones[:3])
+        nivel = impacto.get("nivel", "DESCONOCIDA")
+        score = impacto.get("score")
+        score_txt = f" {score}" if score is not None else ""
+        detalles.append(f"impacto {nivel}{score_txt}" + (f": {razon_txt}" if razon_txt else ""))
+    return f" [{', '.join(detalles)}]" if detalles else ""
 
 
 def _obtener_standings(session, liga: str, team_ids: set, tournament_uid: int = None, season_id: int = None) -> dict:
@@ -1811,9 +2456,14 @@ def _formatear_incidents_para_prompt(datos: dict) -> str:
     if not incidents:
         return ""
 
+    goals = incidents.get("goals", [])
+    cards = incidents.get("cards", [])
+    subs = incidents.get("substitutions", [])
+    if not goals and not cards and not subs:
+        return ""
+
     partes = ["\n### TIMELINE SOFASCORE"]
 
-    goals = incidents.get("goals", [])
     if goals:
         partes.append(f"\n**Goles ({len(goals)}):**")
         for g in goals:
@@ -1823,13 +2473,11 @@ def _formatear_incidents_para_prompt(datos: dict) -> str:
                 f"[{g.get('home_score', '?')}-{g.get('away_score', '?')}]"
             )
 
-    cards = incidents.get("cards", [])
     if cards:
         partes.append(f"\n**Tarjetas ({len(cards)}):**")
         for c in cards:
             partes.append(f"  {c.get('minute', '?')}' {c.get('card_type', '?')} - {c.get('player', '?')}")
 
-    subs = incidents.get("substitutions", [])
     if subs:
         partes.append(f"\n**Sustituciones ({len(subs)}):**")
         for s in subs[:10]:
@@ -1885,22 +2533,73 @@ def _formatear_team_season_stats_para_prompt(datos: dict) -> str:
 
     partes = ["\n### ESTADISTICAS DE TEMPORADA (SofaScore)"]
 
+    def _has_value(value):
+        return value is not None and value != ""
+
+    def _fmt_value(value, decimals: int = 1):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            rounded = round(float(value), decimals)
+            if rounded.is_integer():
+                return int(rounded)
+            return rounded
+        return value
+
+    def _append_pair_line(lines: list, label_a: str, value_a, label_b: str, value_b, suffix: str = ""):
+        chunks = []
+        if _has_value(value_a):
+            chunks.append(f"{label_a}: {_fmt_value(value_a)}{suffix}")
+        if _has_value(value_b):
+            chunks.append(f"{label_b}: {_fmt_value(value_b)}{suffix}")
+        if chunks:
+            lines.append("  " + " | ".join(chunks))
+
     for side, team_name in [("team_stats_local", local_team), ("team_stats_visitante", away_team)]:
         s = ss.get(side, {})
         if not s:
             continue
-        partes.append(f"\n**{team_name}**:")
-        partes.append(f"  PJ: {s.get('matches_played', '?')} | V: {s.get('wins', '?')} | E: {s.get('draws', '?')} | D: {s.get('losses', '?')}")
-        partes.append(f"  GF: {s.get('goals_scored', '?')} | GC: {s.get('goals_conceded', '?')} | CS: {s.get('clean_sheets', '?')}")
-        partes.append(f"  Posesion prom: {s.get('avg_possession', '?')}%")
-        partes.append(f"  Tiros: {s.get('shots', '?')} | A puerta: {s.get('shots_on_target', '?')}")
-        partes.append(f"  Pases prec: {s.get('accurate_passes_pct', '?')}% | Centros prec: {s.get('accurate_crosses_pct', '?')}%")
-        partes.append(f"  Duelos gan: {s.get('duels_won_pct', '?')}% | Aereos gan: {s.get('aerial_duels_won_pct', '?')}%")
-        partes.append(f"  Regates: {s.get('successful_dribbles', '?')}")
-        partes.append(f"  Corners: {s.get('corners', '?')} | Faltas: {s.get('fouls', '?')}")
-        partes.append(f"  Amarillas: {s.get('yellow_cards', '?')} | Rojas: {s.get('red_cards', '?')}")
-        partes.append(f"  Big chances: {s.get('big_chances', '?')} | Creadas: {s.get('big_chances_created', '?')} | Falladas: {s.get('big_chances_missed', '?')}")
 
+        team_lines = [f"\n**{team_name}**:"]
+        record = []
+        for label, key in [("PJ", "matches_played"), ("V", "wins"), ("E", "draws"), ("D", "losses")]:
+            value = s.get(key)
+            if _has_value(value):
+                record.append(f"{label}: {value}")
+        if record:
+            team_lines.append("  " + " | ".join(record))
+
+        goals = []
+        for label, key in [("GF", "goals_scored"), ("GC", "goals_conceded"), ("CS", "clean_sheets")]:
+            value = s.get(key)
+            if _has_value(value):
+                goals.append(f"{label}: {value}")
+        if goals:
+            team_lines.append("  " + " | ".join(goals))
+
+        if _has_value(s.get("avg_possession")):
+            team_lines.append(f"  Posesion prom: {_fmt_value(s.get('avg_possession'))}%")
+        _append_pair_line(team_lines, "Tiros", s.get("shots"), "A puerta", s.get("shots_on_target"))
+        _append_pair_line(team_lines, "Pases prec", s.get("accurate_passes_pct"), "Centros prec", s.get("accurate_crosses_pct"), "%")
+        _append_pair_line(team_lines, "Duelos gan", s.get("duels_won_pct"), "Aereos gan", s.get("aerial_duels_won_pct"), "%")
+        if _has_value(s.get("successful_dribbles")):
+            team_lines.append(f"  Regates: {s.get('successful_dribbles')}")
+        _append_pair_line(team_lines, "Corners", s.get("corners"), "Faltas", s.get("fouls"))
+        _append_pair_line(team_lines, "Amarillas", s.get("yellow_cards"), "Rojas", s.get("red_cards"))
+
+        chances = []
+        for label, key in [("Big chances", "big_chances"), ("Creadas", "big_chances_created"), ("Falladas", "big_chances_missed")]:
+            value = s.get(key)
+            if _has_value(value):
+                chances.append(f"{label}: {value}")
+        if chances:
+            team_lines.append("  " + " | ".join(chances))
+
+        if len(team_lines) > 1:
+            partes.extend(team_lines)
+
+    if len(partes) == 1:
+        return ""
     return "\n".join(partes)
     """Formatea los datos de standings/tabla de posiciones para el prompt, incluyendo tabla completa."""
     ss = datos.get("_sofascore", {})

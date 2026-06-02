@@ -1,16 +1,27 @@
 """
-Muestra el prompt completo que se envía a DeepSeek via OpenRouter.
+Muestra el prompt completo que se envía al modelo via OpenRouter.
 Útil para depuración, auditoría y entender qué datos llegan al modelo.
 
 Uso:
     python show_prompt.py              → interactivo: elegir partido y ver prompt
     python show_prompt.py --save=prompt.txt  → igual pero guarda a archivo
     python show_prompt.py --no-color   → output sin códigos ANSI
+
+Incluye el mismo enriquecimiento que el flujo principal:
+    BSD v2, SofaScore, Betano opcional, proyeccion cuantitativa y splits.
 """
 
 import sys
 import logging
-from analyzer import SYSTEM_PROMPT, _crear_prompt_usuario
+from analyzer import (
+    INCLUDE_REASONING,
+    MAX_TOKENS,
+    MODEL_NAME,
+    OPENROUTER_BASE_URL,
+    SYSTEM_PROMPT,
+    TEMPERATURE,
+    _crear_prompt_usuario,
+)
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -38,6 +49,143 @@ def _mostrar_partidos(partidos: list) -> bool:
     return True
 
 
+def _resumir_capas_datos(datos: dict) -> list[str]:
+    """Resumen corto de las capas que efectivamente llegan al USER_PROMPT."""
+    capas = []
+    v2 = datos.get("_bsd_v2", {}) if isinstance(datos, dict) else {}
+    ss = datos.get("_sofascore", {}) if isinstance(datos, dict) else {}
+
+    if v2:
+        stats = v2.get("stats", {})
+        if _has_v2_stats_data(stats):
+            capas.append("BSD v2 stats")
+        if v2.get("metadata") and "_error" not in v2["metadata"]:
+            capas.append("BSD v2 metadata")
+        lineups_v2 = v2.get("lineups", {})
+        if lineups_v2 and "_error" not in lineups_v2:
+            if _has_bsd_lineup_payload(lineups_v2):
+                capas.append(f"BSD v2 lineups {_lineup_status_label(lineups_v2)}")
+            elif lineups_v2.get("lineup_status"):
+                capas.append(f"BSD v2 lineup status: {lineups_v2.get('lineup_status')}")
+        if _has_player_impact_data(v2.get("player_impact")):
+            capas.append("BSD v2 impacto jugadores")
+        if v2.get("odds") and "_error" not in v2["odds"] and v2["odds"].get("odds"):
+            capas.append("BSD v2 odds comparador")
+        if v2.get("motivation"):
+            capas.append("BSD v2 motivacion/fixtures")
+        if _has_v2_standings_for_prompt(datos, v2.get("standings")):
+            capas.append("BSD v2 standings")
+
+    if ss.get("disponible"):
+        ss_parts = []
+        if ss.get("alineaciones"):
+            ss_parts.append(f"alineaciones {_sofascore_lineup_label(ss.get('alineaciones'))}")
+            if _has_sofascore_missing_impact(ss.get("alineaciones")):
+                ss_parts.append("impacto bajas")
+            if _has_sofascore_xi_impact(ss.get("alineaciones")):
+                ss_parts.append("impacto XI")
+        ss_parts.extend(
+            name for name in ["h2h", "detalle_evento", "form_performance", "standings"]
+            if ss.get(name)
+        )
+        capas.append(f"SofaScore {', '.join(ss_parts) if ss_parts else 'basico'}")
+
+    if datos.get("_cuotas"):
+        capas.append("Betano mercados reales")
+
+    return capas
+
+
+def _has_v2_stats_data(stats: dict) -> bool:
+    if not isinstance(stats, dict) or "_error" in stats:
+        return False
+    per_team = stats.get("stats", {})
+    home = per_team.get("home", {}) if isinstance(per_team, dict) else {}
+    away = per_team.get("away", {}) if isinstance(per_team, dict) else {}
+    return bool(
+        home.get("total_shots") is not None
+        or away.get("total_shots") is not None
+        or stats.get("shotmap")
+        or stats.get("xg_per_minute")
+        or stats.get("momentum")
+    )
+
+
+def _has_bsd_lineup_payload(lineups: dict) -> bool:
+    return bool(lineups.get("lineups") or lineups.get("unavailable_players"))
+
+
+def _has_sofascore_missing_impact(alineaciones: dict) -> bool:
+    if not isinstance(alineaciones, dict):
+        return False
+    for side in ("local", "visitante"):
+        bajas = ((alineaciones.get(side) or {}).get("bajas") or {})
+        for bucket in ("confirmadas", "dudas"):
+            for baja in bajas.get(bucket, []) or []:
+                if baja.get("impacto_baja"):
+                    return True
+    return False
+
+
+def _has_sofascore_xi_impact(alineaciones: dict) -> bool:
+    if not isinstance(alineaciones, dict):
+        return False
+    for side in ("local", "visitante"):
+        for player in (alineaciones.get(side) or {}).get("titulares", []) or []:
+            if player.get("impacto_jugador"):
+                return True
+    return False
+
+
+def _has_player_impact_data(impact: dict) -> bool:
+    if not isinstance(impact, dict) or "_error" in impact:
+        return False
+    for player in impact.get("players", []) or []:
+        stats = player.get("stats") or {}
+        if not isinstance(stats, dict) or "_error" in stats:
+            continue
+        for key in ("xg_p90", "shots_p90", "key_passes_p90", "yellow_p90", "saves_p90", "goals", "assists"):
+            value = stats.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                return True
+    return False
+
+
+def _has_v2_standings_for_prompt(datos: dict, standings: dict) -> bool:
+    if not isinstance(standings, dict) or "_error" in standings:
+        return False
+    liga = datos.get("liga", "")
+    rn = (datos.get("_v2_detail") or {}).get("round_number")
+    is_cup_group = rn and any(c in liga for c in ["Champions", "Europa", "Libertadores", "Sudamericana"]) and rn <= 8
+    rows = standings.get("standings")
+    groups = standings.get("groups")
+    if is_cup_group and isinstance(rows, dict) and len(rows) > 1:
+        return False
+    if is_cup_group and isinstance(rows, list) and len(rows) > 8:
+        return False
+    if is_cup_group and isinstance(groups, dict) and len(groups) > 1:
+        return False
+    if is_cup_group and isinstance(groups, list) and len(groups) > 1:
+        return False
+    return bool(rows or groups)
+
+
+def _lineup_status_label(lineups: dict) -> str:
+    if lineups.get("confirmed") or lineups.get("is_confirmed"):
+        return "confirmadas"
+    status = lineups.get("lineup_status")
+    if status:
+        return f"({status})"
+    return "preliminares"
+
+
+def _sofascore_lineup_label(alineaciones: dict) -> str:
+    sides = [alineaciones.get("local") or {}, alineaciones.get("visitante") or {}]
+    if sides and all(side.get("confirmada") for side in sides if side):
+        return "confirmadas"
+    return "preliminares"
+
+
 def _seleccionar_partido(partidos: list) -> dict:
     while True:
         try:
@@ -63,7 +211,7 @@ def _cargar_datos_partido(partido: dict):
         resumir_prediccion,
     )
     from sofascore_client import enriquecer_datos_partido, obtener_datos_completos_sofascore
-    from betsafe_client import obtener_cuotas_betsafe_desde_url
+    from betano_client import obtener_cuotas_betano_desde_url
 
     match_id = partido.get("id")
     local = partido.get("home_team", "?")
@@ -127,8 +275,20 @@ def _cargar_datos_partido(partido: dict):
             v2_parts.append("stats (shotmap,momentum,xg_per_minute)")
         if v2.get("metadata") and "_error" not in v2["metadata"]:
             v2_parts.append("metadata (facts,AI preview)")
+        lineups_v2 = v2.get("lineups", {})
+        if lineups_v2 and "_error" not in lineups_v2:
+            if lineups_v2.get("lineups") or lineups_v2.get("unavailable_players"):
+                v2_parts.append(f"lineups BSD {_lineup_status_label(lineups_v2)}")
+            elif lineups_v2.get("lineup_status"):
+                v2_parts.append(f"lineup status BSD: {lineups_v2.get('lineup_status')}")
         if v2.get("player_stats") and "_error" not in v2["player_stats"]:
             v2_parts.append("player-stats")
+        if v2.get("player_impact") and "_error" not in v2["player_impact"]:
+            v2_parts.append("impacto jugadores")
+        if v2.get("odds") and "_error" not in v2["odds"]:
+            v2_parts.append("odds consenso")
+        if v2.get("motivation"):
+            v2_parts.append("motivacion/fixtures")
         if v2.get("standings") and "_error" not in v2["standings"]:
             v2_parts.append("standings (xG)")
         if v2_parts:
@@ -146,13 +306,13 @@ def _cargar_datos_partido(partido: dict):
         print(f"  [WARN] SofaScore: {e}")
 
     try:
-        print("  Pegá la URL de Betsafe o el eventId (Enter para omitir):")
+        print("  Pegá la URL completa de Betano (Enter para omitir):")
         url = input("  > ").strip()
         if url:
-            cuotas = obtener_cuotas_betsafe_desde_url(url)
+            cuotas = obtener_cuotas_betano_desde_url(url)
             if cuotas and "error" not in cuotas and cuotas.get("markets"):
                 datos_resumidos["_cuotas"] = cuotas
-                print("  [OK] Betsafe")
+                print("  [OK] Betano")
             else:
                 print(f"  Error: {cuotas.get('error', '?')}")
     except Exception:
@@ -163,23 +323,24 @@ def _cargar_datos_partido(partido: dict):
 
 def show_prompt(datos, prediccion, save_to=None):
     """
-    Construye y muestra el prompt completo que se enviaria a DeepSeek.
+    Construye y muestra el prompt completo que se enviaria al modelo configurado.
     """
     from quant_model import run_full_projection
-    quant_projections, _ = run_full_projection(datos, prediccion)
-    user_prompt = _crear_prompt_usuario(datos, prediccion, quant_projections)
+    quant_projections, features = run_full_projection(datos, prediccion)
+    user_prompt = _crear_prompt_usuario(datos, prediccion, quant_projections, features)
     total_chars = len(SYSTEM_PROMPT) + len(user_prompt)
     total_tokens_approx = total_chars // 4
+    capas = _resumir_capas_datos(datos)
 
     header = f"""
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│                     PROMPT COMPLETO → DEEPSEEK                               │
+│                     PROMPT COMPLETO → MODELO                                 │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│  Modelo      : deepseek/deepseek-v4-pro (via OpenRouter)                     │
-│  Endpoint    : https://openrouter.ai/api/v1                                  │
-│  max_tokens  : 100000                                                        │
-│  temperature : 0.3                                                           │
-│  reasoning   : True (include_reasoning)                                      │
+│  Modelo      : {MODEL_NAME:<61}│
+│  Endpoint    : {OPENROUTER_BASE_URL:<61}│
+│  max_tokens  : {str(MAX_TOKENS):<61}│
+│  temperature : {str(TEMPERATURE):<61}│
+│  reasoning   : {str(INCLUDE_REASONING):<61}│
 ├──────────────────────────────────────────────────────────────────────────────┤
 │  System prompt : {len(SYSTEM_PROMPT):>7,} chars ({len(SYSTEM_PROMPT)//4:,} ~tokens)                 │
 │  User prompt   : {len(user_prompt):>7,} chars ({len(user_prompt)//4:,} ~tokens)                 │
@@ -187,14 +348,21 @@ def show_prompt(datos, prediccion, save_to=None):
 └──────────────────────────────────────────────────────────────────────────────┘
 """
     print(header)
+    if capas:
+        print("  Capas de datos detectadas:")
+        for capa in capas:
+            print(f"  - {capa}")
+        print()
 
     if save_to:
         with open(save_to, "w", encoding="utf-8") as f:
             f.write("=" * 80 + "\n")
-            f.write("PROMPT COMPLETO ENVIADO A DEEPSEEK\n")
-            f.write(f"Modelo: deepseek/deepseek-v4-pro\n")
-            f.write(f"Temperature: 0.3 | max_tokens: 100000 | include_reasoning: True\n")
+            f.write("PROMPT COMPLETO ENVIADO AL MODELO\n")
+            f.write(f"Modelo: {MODEL_NAME}\n")
+            f.write(f"Temperature: {TEMPERATURE} | max_tokens: {MAX_TOKENS} | include_reasoning: {INCLUDE_REASONING}\n")
             f.write(f"System: {len(SYSTEM_PROMPT)} chars | User: {len(user_prompt)} chars\n")
+            if capas:
+                f.write("Capas de datos: " + ", ".join(capas) + "\n")
             f.write("=" * 80 + "\n\n")
             f.write("=== SYSTEM PROMPT ===\n\n")
             f.write(SYSTEM_PROMPT)

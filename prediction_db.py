@@ -69,7 +69,11 @@ def init_db():
                 llm_recommendation TEXT,
                 llm_confidence TEXT,
 
-                -- Cuotas Betsafe registradas (JSON)
+                -- Cuotas del bookmaker registradas (JSON)
+                bookmaker_odds_json TEXT,
+                odds_source TEXT,
+
+                -- Cuotas Betsafe registradas (JSON, legacy)
                 betsafe_odds_json TEXT,
 
                 -- Predicción BSD CatBoost (JSON)
@@ -81,6 +85,9 @@ def init_db():
                 UNIQUE(match_id, created_at)
             )
         """)
+
+        _ensure_column(cursor, "predictions", "bookmaker_odds_json", "TEXT")
+        _ensure_column(cursor, "predictions", "odds_source", "TEXT")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS results (
@@ -156,6 +163,13 @@ def init_db():
         print(f"  [DB] Base de datos inicializada: {DB_PATH}")
 
 
+def _ensure_column(cursor, table: str, column: str, column_type: str):
+    cursor.execute(f"PRAGMA table_info({table})")
+    existing = {row["name"] for row in cursor.fetchall()}
+    if column not in existing:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
 def save_prediction(
     match_id: str,
     match_name: str,
@@ -163,11 +177,12 @@ def save_prediction(
     match_date: str,
     quant_projections: dict,
     llm_projections: dict,
-    betsafe_odds: dict,
+    bookmaker_odds: dict,
     bsd_pred: dict,
     features: dict,
 ) -> int:
     """Guarda una predicción. Retorna el ID insertado."""
+    odds_source = (bookmaker_odds or {}).get("source") or (bookmaker_odds or {}).get("bookmaker")
     with _conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -183,8 +198,8 @@ def save_prediction(
                 llm_proj_goals_local, llm_proj_goals_visitor,
                 llm_proj_tiros_total, llm_proj_corners_total, llm_proj_yc_total,
                 llm_recommendation, llm_confidence,
-                betsafe_odds_json, bsd_pred_json, features_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                bookmaker_odds_json, odds_source, betsafe_odds_json, bsd_pred_json, features_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 match_id, match_name, league, match_date,
@@ -212,7 +227,9 @@ def save_prediction(
                 llm_projections.get("yc_total"),
                 llm_projections.get("recommendation"),
                 llm_projections.get("confidence"),
-                json.dumps(betsafe_odds, ensure_ascii=False) if betsafe_odds else None,
+                json.dumps(bookmaker_odds, ensure_ascii=False) if bookmaker_odds else None,
+                odds_source,
+                json.dumps(bookmaker_odds, ensure_ascii=False) if bookmaker_odds else None,
                 json.dumps(bsd_pred, ensure_ascii=False) if bsd_pred else None,
                 json.dumps(features, ensure_ascii=False) if features else None,
             ),
@@ -249,14 +266,21 @@ def save_result(match_id: str, result_data: dict) -> int:
                 btts, over25, result_1x2
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(match_id) DO UPDATE SET
+                prediction_id=excluded.prediction_id,
                 score_local=excluded.score_local,
                 score_visitor=excluded.score_visitor,
                 tiros_local=excluded.tiros_local,
                 tiros_visitor=excluded.tiros_visitor,
+                tiros_arco_local=excluded.tiros_arco_local,
+                tiros_arco_visitor=excluded.tiros_arco_visitor,
                 corners_local=excluded.corners_local,
                 corners_visitor=excluded.corners_visitor,
                 yc_local=excluded.yc_local,
                 yc_visitor=excluded.yc_visitor,
+                rc_local=excluded.rc_local,
+                rc_visitor=excluded.rc_visitor,
+                fouls_local=excluded.fouls_local,
+                fouls_visitor=excluded.fouls_visitor,
                 btts=excluded.btts,
                 over25=excluded.over25,
                 result_1x2=excluded.result_1x2,
@@ -278,8 +302,8 @@ def save_result(match_id: str, result_data: dict) -> int:
                 result_data.get("rc_visitor"),
                 result_data.get("fouls_local"),
                 result_data.get("fouls_visitor"),
-                1 if result_data.get("btts") else 0,
-                1 if result_data.get("over25") else 0,
+                None if result_data.get("btts") is None else int(bool(result_data.get("btts"))),
+                None if result_data.get("over25") is None else int(bool(result_data.get("over25"))),
                 result_data.get("result_1x2"),
             ),
         )
@@ -301,6 +325,11 @@ def _record_errors(conn, pred_id: int, match_id: str, actual: dict):
     if not pred_row:
         return
 
+    cursor.execute(
+        "DELETE FROM model_errors WHERE prediction_id = ?",
+        (pred_id,),
+    )
+
     # Combinar cuantitativo + LLM (si existe LLM, pesa más)
     def blended(field_quant, field_llm):
         q = pred_row[field_quant]
@@ -309,12 +338,17 @@ def _record_errors(conn, pred_id: int, match_id: str, actual: dict):
             return 0.5 * q + 0.5 * l
         return q if q is not None else l
 
+    def sum_if_complete(left, right):
+        if actual.get(left) is None or actual.get(right) is None:
+            return None
+        return actual.get(left) + actual.get(right)
+
     pairs = [
         ("goals_local", blended("proj_goals_local", "llm_proj_goals_local"), actual.get("score_local")),
         ("goals_visitor", blended("proj_goals_visitor", "llm_proj_goals_visitor"), actual.get("score_visitor")),
-        ("tiros_total", blended("proj_tiros_total", "llm_proj_tiros_total"), (actual.get("tiros_local") or 0) + (actual.get("tiros_visitor") or 0)),
-        ("corners_total", blended("proj_corners_total", "llm_proj_corners_total"), (actual.get("corners_local") or 0) + (actual.get("corners_visitor") or 0)),
-        ("yc_total", blended("proj_yc_total", "llm_proj_yc_total"), (actual.get("yc_local") or 0) + (actual.get("yc_visitor") or 0)),
+        ("tiros_total", blended("proj_tiros_total", "llm_proj_tiros_total"), sum_if_complete("tiros_local", "tiros_visitor")),
+        ("corners_total", blended("proj_corners_total", "llm_proj_corners_total"), sum_if_complete("corners_local", "corners_visitor")),
+        ("yc_total", blended("proj_yc_total", "llm_proj_yc_total"), sum_if_complete("yc_local", "yc_visitor")),
     ]
 
     for metric, predicted, real in pairs:
@@ -326,7 +360,6 @@ def _record_errors(conn, pred_id: int, match_id: str, actual: dict):
             """
             INSERT INTO model_errors (prediction_id, match_id, metric, predicted, actual, abs_error, squared_error, pct_error)
             VALUES (?,?,?,?,?,?,?,?)
-            ON CONFLICT DO NOTHING
             """,
             (pred_id, match_id, metric, round(predicted, 2), real, round(err, 2), round(err ** 2, 2), round(pct_err, 4) if pct_err else None),
         )

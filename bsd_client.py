@@ -12,33 +12,13 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from dotenv import load_dotenv
+from competition_config import LEAGUE_NAMES, TARGET_LEAGUE_IDS, TOP_LEAGUES
 
 load_dotenv()
 
 BSD_BASE_URL = "https://sports.bzzoiro.com/api"
 BSD_V2_BASE = "https://sports.bzzoiro.com/api/v2"
 BSD_API_KEY = os.getenv("BSD_API_KEY")
-
-# IDs de ligas y torneos según BSD
-TOP_LEAGUES = {
-    "Brasileirao Serie A": 9,
-    "Premier League": 1,
-    "La Liga": 3,
-    "Bundesliga": 5,
-    "Serie A": 4,
-    "Ligue 1": 6,
-    "Champions League": 7,
-    "Europa League": 8,
-    "Copa Libertadores": 32,
-    "Copa Sudamericana": 33,
-}
-
-# IDs de las ligas y torneos objetivo para el análisis
-TARGET_LEAGUE_IDS = [9, 3, 5, 4, 6, 1, 7, 8, 32, 33]
-
-# Mapeo de ID de liga a nombre
-LEAGUE_NAMES = {v: k for k, v in TOP_LEAGUES.items()}
-
 
 def _headers():
     """Encabezados de autenticación para la BSD API."""
@@ -85,7 +65,7 @@ def obtener_proximos_partidos(league_ids: list = None) -> list:
     para mantener compatibilidad con codigo que espera el formato v1.
 
     Args:
-        league_ids: Lista de IDs de liga. Si es None, usa las 5 grandes.
+        league_ids: Lista de IDs de liga. Si es None, usa competiciones default.
 
     Returns:
         Lista de partidos próximos (status='notstarted').

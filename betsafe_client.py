@@ -50,6 +50,8 @@ MARKET_LABELS = {
     "TORC": "Total Red Cards",
     "TOSG": "Total Shots on Goal",
     "TSTOUM": "Total Shots",
+    "TOFOUL": "Total Fouls",
+    "TOFLS": "Total Fouls",
     "PLYPROPSHOT": "Player Shots",
     "PLYPROPGASM": "Player Goals",
     "SCMOFSH": "Method of Score",
@@ -84,6 +86,10 @@ def _categorize_market(name: str) -> str:
         return "Cards"
     if any(w in name for w in ["Anotador", "Goleador", "Hat-trick", "Hat Trick"]):
         return "Goalscorers"
+    if "falta" in nl or "foul" in nl:
+        if "|" in name or "jugador" in nl or "player" in nl:
+            return "Player Stats"
+        return "Fouls"
     if "faltas cometidas" in nl:
         return "Player Stats"
     if "total de tiros" in nl or "tiros al arco" in nl:
@@ -187,9 +193,14 @@ async def _obtener_cuotas_betsafe_async(home_team: str, away_team: str, event_id
             except Exception:
                 pass
 
+        await _force_load_betsafe_stat_markets(page, home_team, away_team)
+
         for _ in range(5):
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await _scroll_betsafe_containers(page)
             await page.wait_for_timeout(2000)
+
+        await _force_load_betsafe_stat_markets(page, home_team, away_team)
 
         # ── Batch-fetch remaining market odds using captured headers ──
         accordion_markets: dict[str, dict] = {}
@@ -415,6 +426,91 @@ async def _click_competition_filter(page, competition: str, home_team: str, away
     return None
 
 
+async def _scroll_betsafe_containers(page):
+    """Betsafe often scrolls the market list inside nested containers, not window."""
+    try:
+        await page.evaluate("""
+            () => {
+                const scrollables = Array.from(document.querySelectorAll('*')).filter(el => {
+                    const style = window.getComputedStyle(el);
+                    const overflowY = style.overflowY || '';
+                    return /(auto|scroll)/.test(overflowY) && el.scrollHeight > el.clientHeight + 80;
+                });
+                for (const el of scrollables) {
+                    el.scrollTop = Math.min(el.scrollTop + 900, el.scrollHeight);
+                }
+                window.scrollBy(0, 900);
+            }
+        """)
+    except Exception:
+        pass
+
+
+async def _click_first_text(page, text: str, exact: bool = False) -> bool:
+    try:
+        loc = page.get_by_text(text, exact=exact).first
+        if await loc.count() == 0:
+            loc = page.locator(f"text={text}").first
+        if await loc.count() == 0:
+            return False
+        await loc.scroll_into_view_if_needed(timeout=1500)
+        await loc.click(timeout=1500)
+        await page.wait_for_timeout(700)
+        return True
+    except Exception:
+        return False
+
+
+async def _force_load_betsafe_stat_markets(page, home_team: str = "", away_team: str = ""):
+    """
+    Force Betsafe to materialize lower statistical accordions.
+
+    The market list is virtualized on some pages: total shots/SOT may load, but
+    fouls and throw-ins sit further down in an internal scroll container. This
+    pass explicitly opens the stats tab/accordions and scrolls those containers
+    so their accordion + event-market API calls are captured.
+    """
+    tab_terms = [
+        "Estadísticas del partido",
+        "Estadisticas del partido",
+        "Total de tiros al arco",
+        "Total de faltas cometidas",
+        "Total de faltas",
+    ]
+    for term in tab_terms:
+        await _click_first_text(page, term)
+
+    team_terms = []
+    for team in (home_team, away_team):
+        if team:
+            team_terms.extend([
+                f"{team} - Total de faltas",
+                f"{team} – Total de faltas",
+                f"{team} - Total de faltas cometidas",
+                f"{team} – Total de faltas cometidas",
+            ])
+
+    accordion_terms = [
+        "Total de faltas cometidas",
+        "Total de faltas",
+        "Más faltas",
+        "Mas faltas",
+        "Total de saques de banda",
+        "Total de tiros al arco",
+        *team_terms,
+    ]
+
+    for _ in range(8):
+        for term in accordion_terms:
+            await _click_first_text(page, term)
+        await _scroll_betsafe_containers(page)
+        try:
+            await page.mouse.wheel(0, 900)
+        except Exception:
+            pass
+        await page.wait_for_timeout(900)
+
+
 def _find_event_in_text(text: str, home_team: str, away_team: str) -> str | None:
     """Fallback legacy: busca event ID en texto plano."""
     home_norm = normalizar_nombre(home_team).lower()
@@ -500,6 +596,16 @@ def _is_team_total_corners_market(name: str, home_team: str = "", away_team: str
     return _is_team_total_market(name, "total de tiros de esquina", home_team, away_team)
 
 
+def _is_team_total_fouls_market(name: str, home_team: str = "", away_team: str = "") -> bool:
+    suffixes = [
+        "total de faltas",
+        "total de faltas cometidas",
+        "total faltas",
+        "faltas cometidas",
+    ]
+    return any(_is_team_total_market(name, suffix, home_team, away_team) for suffix in suffixes)
+
+
 def _formatear_cuotas_betsafe_para_prompt(result: dict) -> str:
     """Formatea cuotas de Betsafe para el prompt del analyzer - SOLO mercados de valor."""
     if not result or "error" in result:
@@ -568,6 +674,17 @@ def _formatear_cuotas_betsafe_para_prompt(result: dict) -> str:
             r"^total de tiros al arco \(\d+(\.\d+)?\)$",
         ],
         "Team Match Stats": [],
+        "Fouls": [
+            r"^total de faltas$",
+            r"^total de faltas \(\d+(\.\d+)?\)$",
+            r"^total faltas$",
+            r"^total faltas \(\d+(\.\d+)?\)$",
+            r"^faltas totales$",
+            r"^faltas totales \(\d+(\.\d+)?\)$",
+            r"^total de faltas cometidas$",
+            r"^total de faltas cometidas \(\d+(\.\d+)?\)$",
+        ],
+        "Team Fouls": [],
         "Halves": [
             r"^1er tiempo - ganador$",
             r"^2º tiempo - ganador$",
@@ -588,6 +705,8 @@ def _formatear_cuotas_betsafe_para_prompt(result: dict) -> str:
                 matches_filter = _is_team_total_shots_market(mdata.get("name", ""), home_team, away_team)
             elif cat_key == "Team Corners":
                 matches_filter = _is_team_total_corners_market(mdata.get("name", ""), home_team, away_team)
+            elif cat_key == "Team Fouls":
+                matches_filter = _is_team_total_fouls_market(mdata.get("name", ""), home_team, away_team)
             if matches_filter:
                 selections = mdata.get("selections", [])
                 if selections:
@@ -599,7 +718,7 @@ def _formatear_cuotas_betsafe_para_prompt(result: dict) -> str:
                     shown.append(f"  {mdata.get('name', mk)}: {' | '.join(sels)}")
         if shown:
             # Sort shot markets numerically by line value when possible.
-            if cat_key in {"Corners", "Team Corners", "Match Stats", "Team Match Stats"}:
+            if cat_key in {"Corners", "Team Corners", "Match Stats", "Team Match Stats", "Fouls", "Team Fouls"}:
                 def _sort_key(item):
                     m = re.search(r'\((\d+(?:\.\d+)?)\)', item)
                     if not m:
@@ -612,6 +731,7 @@ def _formatear_cuotas_betsafe_para_prompt(result: dict) -> str:
                 "Corners": "CORNERS", "Cards": "TARJETAS",
                 "Team Corners": "CORNERS POR EQUIPO",
                 "Match Stats": "TIROS", "Team Match Stats": "TIROS POR EQUIPO",
+                "Fouls": "FALTAS", "Team Fouls": "FALTAS POR EQUIPO",
                 "Halves": "TIEMPOS", "Specials": "CLASIFICACION",
             }.get(cat_key, cat_key.upper())
             partes.append(f"**{cat_label}**")

@@ -1,0 +1,115 @@
+{
+  "data": {
+    "event": {
+      "id": "85915325",
+      "name": "Palmeiras SP - Chapecoense SC",
+      "leagueName": "Brasileirao - Serie A Betano",
+      "participants": [
+        {"id": 108263, "name": "Palmeiras SP"},
+        {"id": 109654, "name": "Chapecoense SC"}
+      ],
+      "markets": [
+        {
+          "id": "2766845592",
+          "name": "Resultado del partido",
+          "type": "MRES",
+          "typeId": 1,
+          "selections": [
+            {"id": "1", "name": "1", "fullName": "Palmeiras SP", "price": 1.36, "handicap": 0.0},
+            {"id": "x", "name": "X", "fullName": "Empate", "price": 4.9, "handicap": 0.0},
+            {"id": "2", "name": "2", "fullName": "Chapecoense SC", "price": 9.0, "handicap": 0.0}
+          ]
+        },
+        {
+          "id": "2766881843",
+          "name": "Goles totales Más/Menos",
+          "type": "HCTG",
+          "typeId": 13,
+          "selections": [
+            {"id": "g1", "name": "Más 2.5", "price": 1.67, "handicap": 2.5},
+            {"id": "g2", "name": "Menos 2.5", "price": 2.2, "handicap": 2.5}
+          ]
+        },
+        {
+          "id": "2766845601",
+          "name": "Ambos equipos anotan",
+          "type": "BTSC",
+          "typeId": 15,
+          "selections": [
+            {"id": "b1", "name": "Sí", "price": 1.98, "handicap": 0.0},
+            {"id": "b2", "name": "No", "price": 1.78, "handicap": 0.0}
+          ]
+        },
+        {
+          "id": "2766881805",
+          "name": "Más/Menos Córners",
+          "type": "CNOU",
+          "typeId": 34,
+          "selections": [
+            {"id": "c1", "name": "Más 10.5", "price": 1.95, "handicap": 10.5},
+            {"id": "c2", "name": "Menos 10.5", "price": 1.8, "handicap": 10.5}
+          ]
+        },
+        {
+          "id": "2766845596",
+          "name": "Tarjetas Totales Más/Menos",
+          "type": "TCOU",
+          "typeId": 408,
+          "selections": [
+            {"id": "t1", "name": "Más 4.5", "price": 1.88, "handicap": 4.5},
+            {"id": "t2", "name": "Menos 4.5", "price": 1.85, "handicap": 4.5}
+          ]
+        },
+        {
+          "id": "2784570482",
+          "name": "Remates totales",
+          "type": "4159",
+          "typeId": 4159,
+          "selections": [
+            {"id": "r1", "name": "Más 27.5", "price": 1.91, "handicap": 27.5},
+            {"id": "r2", "name": "Menos 27.5", "price": 1.83, "handicap": 27.5}
+          ]
+        },
+        {
+          "id": "2783398587",
+          "name": "Tiros al Arco",
+          "type": "X002",
+          "typeId": 999,
+          "selections": [
+            {"id": "s1", "name": "Más 9.5", "price": 2.0, "handicap": 9.5},
+            {"id": "s2", "name": "Menos 9.5", "price": 1.75, "handicap": 9.5}
+          ]
+        },
+        {
+          "id": "2786965273",
+          "name": "Total de Faltas Cometidas",
+          "type": "4629",
+          "typeId": 4629,
+          "selections": [
+            {"id": "f1", "name": "Más 27.5", "price": 1.8, "handicap": 27.5},
+            {"id": "f2", "name": "Menos 27.5", "price": 1.93, "handicap": 27.5}
+          ]
+        },
+        {
+          "id": "player-shots",
+          "name": "Alan Franco Remates totales",
+          "type": "PALS",
+          "typeId": 595,
+          "selections": [
+            {"id": "ps1", "name": "1+", "price": 2.12, "handicap": 0.0},
+            {"id": "ps2", "name": "2+", "price": 6.8, "handicap": 0.0}
+          ]
+        },
+        {
+          "id": "player-fouls",
+          "name": "Faltas cometidas [Alan Franco]",
+          "type": "1000095",
+          "typeId": 1000095,
+          "selections": [
+            {"id": "pf1", "name": "Más 1.5", "price": 3.32, "handicap": 1.5}
+          ]
+        }
+      ]
+    }
+  }
+}

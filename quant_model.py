@@ -13,6 +13,19 @@ import json
 import math
 from typing import Dict, Optional, List
 
+from competition_config import get_competition_flags
+
+
+_MARKET_STAT_KEYS = {
+    "shots": "tiros_total",
+    "sot": "tiros_arco",
+    "corners": "corners",
+    "yc": "amarillas",
+    "fouls": "faltas",
+}
+
+_FORWARD_POSITIONS = {"f", "fw", "forward", "striker"}
+
 
 def _weighted_avg(values: List[float], weights: Optional[List[float]] = None) -> Optional[float]:
     """Promedio ponderado; por defecto pondera más lo reciente."""
@@ -74,20 +87,37 @@ def _parse_form_string(form_str: str) -> int:
 
 def _first_number(*values):
     for value in values:
-        if isinstance(value, (int, float)):
-            return value
+        parsed = _maybe_float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _maybe_float(value) -> Optional[float]:
+    """Convierte números aunque SofaScore/BSD los entregue como string."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        clean = value.strip().replace(",", ".")
+        try:
+            return float(clean)
+        except ValueError:
+            return None
     return None
 
 
 def _num(value, default: float) -> float:
     """Devuelve value si es numérico; si no, default."""
-    return float(value) if isinstance(value, (int, float)) else default
+    parsed = _maybe_float(value)
+    return parsed if parsed is not None else default
 
 
 def _season_per_match(stats: dict, key: str) -> Optional[float]:
-    value = stats.get(key)
-    matches = stats.get("matches_played")
-    if not isinstance(value, (int, float)) or not isinstance(matches, (int, float)) or matches <= 0:
+    value = _maybe_float(stats.get(key))
+    matches = _maybe_float(stats.get("matches_played"))
+    if value is None or matches is None or matches <= 0:
         return None
     return round(value / matches, 2)
 
@@ -104,9 +134,127 @@ def _sofascore_recent_avg(ss: dict, perf_key: str, stat_key: str) -> Optional[fl
         stat = stats_list[idx].get(stat_key, {})
         side = "home" if match.get("local") else "away"
         value = stat.get(side)
-        if isinstance(value, (int, float)):
-            values.append(value)
+        parsed = _maybe_float(value)
+        if parsed is not None:
+            values.append(parsed)
     return _weighted_avg(values[:5]) if values else None
+
+
+def _norm_text(value: str) -> str:
+    return (value or "").strip().casefold()
+
+
+def _stat_value_for_team(stat: dict, stat_key: str, team_home: bool, against: bool = False) -> Optional[float]:
+    values = stat.get(stat_key, {}) if isinstance(stat, dict) else {}
+    if not isinstance(values, dict):
+        return None
+    side = "home" if team_home else "away"
+    if against:
+        side = "away" if team_home else "home"
+    value = values.get(side)
+    return _maybe_float(value)
+
+
+def _split_stat_avg(
+    ss: dict,
+    perf_key: str,
+    stat_key: str,
+    venue: Optional[bool] = None,
+    tournament: Optional[str] = None,
+    against: bool = False,
+) -> tuple[Optional[float], int]:
+    """Promedio ponderado por split: reciente, casa/fuera y/o torneo."""
+    perf = ss.get(perf_key, {})
+    detalle = perf.get("detalle", [])
+    stats_list = ss.get(f"{perf_key}_stats_per_match", [])
+    target_tournament = _norm_text(tournament or "")
+    values = []
+
+    for idx, match in enumerate(detalle):
+        if idx >= len(stats_list) or not stats_list[idx]:
+            continue
+        team_home = bool(match.get("local"))
+        if venue is not None and team_home != venue:
+            continue
+        if target_tournament and _norm_text(match.get("torneo", "")) != target_tournament:
+            continue
+        value = _stat_value_for_team(stats_list[idx], stat_key, team_home, against=against)
+        if value is not None:
+            values.append(value)
+
+    return (_weighted_avg(values[:5]) if values else None, len(values))
+
+
+def _build_team_market_splits(ss: dict, perf_key: str, current_tournament: str) -> dict:
+    """Crea splits a favor/concedidos para mercados estadísticos."""
+    split_specs = {
+        "recent": {},
+        "home": {"venue": True},
+        "away": {"venue": False},
+    }
+    if current_tournament:
+        split_specs.update({
+            "current": {"tournament": current_tournament},
+            "current_home": {"tournament": current_tournament, "venue": True},
+            "current_away": {"tournament": current_tournament, "venue": False},
+        })
+
+    result = {}
+    for split_name, filters in split_specs.items():
+        split = {}
+        max_n = 0
+        for metric, stat_key in _MARKET_STAT_KEYS.items():
+            avg_for, n_for = _split_stat_avg(ss, perf_key, stat_key, against=False, **filters)
+            avg_against, n_against = _split_stat_avg(ss, perf_key, stat_key, against=True, **filters)
+            if avg_for is not None or avg_against is not None:
+                split[metric] = {"for": avg_for, "against": avg_against}
+                max_n = max(max_n, n_for, n_against)
+        if split:
+            split["n"] = max_n
+            result[split_name] = split
+    return result
+
+
+def _apply_market_split_features(features: dict, ss: dict):
+    current_tournament = ss.get("torneo", "")
+    splits = {
+        "local": _build_team_market_splits(ss, "form_performance_local", current_tournament),
+        "visitor": _build_team_market_splits(ss, "form_performance_visitante", current_tournament),
+    }
+    if any(splits.values()):
+        features["market_splits"] = splits
+
+
+def _split_value(features: dict, side: str, split: str, metric: str, field: str) -> Optional[float]:
+    value = (
+        features.get("market_splits", {})
+        .get(side, {})
+        .get(split, {})
+        .get(metric, {})
+        .get(field)
+    )
+    return _maybe_float(value)
+
+
+def _best_split_value(
+    features: dict,
+    side: str,
+    metric: str,
+    field: str,
+    preferred_splits: list[str],
+    fallback: Optional[float] = None,
+) -> Optional[float]:
+    for split in preferred_splits:
+        value = _split_value(features, side, split, metric, field)
+        if value is not None:
+            return value
+    return _maybe_float(fallback)
+
+
+def _blend_attack_defense(attack: Optional[float], opponent_conceded: Optional[float], attack_weight: float = 0.62) -> Optional[float]:
+    if attack is not None and opponent_conceded is not None:
+        return attack * attack_weight + opponent_conceded * (1 - attack_weight)
+    return attack if attack is not None else opponent_conceded
 
 
 def _apply_sofascore_features(features: dict, ss: dict):
@@ -142,6 +290,7 @@ def _apply_sofascore_features(features: dict, ss: dict):
 
     features["corners_local_avg"] = _sofascore_recent_avg(ss, "form_performance_local", "corners")
     features["corners_visitor_avg"] = _sofascore_recent_avg(ss, "form_performance_visitante", "corners")
+    _apply_market_split_features(features, ss)
 
     season_local = ss.get("team_stats_local", {})
     season_visitor = ss.get("team_stats_visitante", {})
@@ -158,8 +307,47 @@ def _apply_sofascore_features(features: dict, ss: dict):
         ("corners_visitor_avg", _season_per_match(season_visitor, "corners")),
     ]
     for target, value in season_map:
-        if features.get(target) is None and isinstance(value, (int, float)):
+        if features.get(target) is None and _maybe_float(value) is not None:
             features[target] = value
+
+
+def _position_is_forward(position: str) -> bool:
+    return (position or "").strip().casefold() in _FORWARD_POSITIONS
+
+
+def _missing_forward_count(lineup_side: dict) -> int:
+    bajas = (lineup_side or {}).get("bajas", {})
+    count = 0
+    for player in bajas.get("confirmadas", []) or []:
+        if _position_is_forward(player.get("posicion")):
+            count += 1
+    return count
+
+
+def _apply_lineup_absence_features(features: dict, ss: dict):
+    """Extrae ausencias ofensivas simples para no inflar tiros al arco."""
+    lineups = ss.get("alineaciones", {}) if isinstance(ss, dict) else {}
+    if not isinstance(lineups, dict):
+        return
+    features["missing_forwards_local"] = _missing_forward_count(lineups.get("local", {}))
+    features["missing_forwards_visitor"] = _missing_forward_count(lineups.get("visitante", {}))
+
+
+def _sot_cap_ratio(features: dict, side: str) -> float:
+    """Techo conservador para tiros al arco sobre tiros totales."""
+    missing_key = "missing_forwards_local" if side == "local" else "missing_forwards_visitor"
+    missing_forwards = int(features.get(missing_key) or 0)
+    if missing_forwards >= 2:
+        return 0.32
+    if missing_forwards == 1:
+        return 0.34
+    return 0.38
+
+
+def _cap_sot_projection(raw_sot: float, shots: float, features: dict, side: str) -> float:
+    """Evita que un equipo con mucho volumen proyecte SOT irreal sin calidad ofensiva."""
+    cap = max(1.0, shots * _sot_cap_ratio(features, side))
+    return max(1.0, min(raw_sot, cap))
 
 
 def build_features(datos_resumidos: dict, prediccion_resumida: dict) -> dict:
@@ -168,6 +356,9 @@ def build_features(datos_resumidos: dict, prediccion_resumida: dict) -> dict:
     alimentar al modelo cuantitativo.
     """
     features = {}
+    league_id = datos_resumidos.get("league_id")
+    league_name = datos_resumidos.get("liga")
+    features.update(get_competition_flags(league_id, league_name))
 
     # --- Datos BSD v1 ---
     forma_loc = datos_resumidos.get("forma_local", {})
@@ -210,8 +401,12 @@ def build_features(datos_resumidos: dict, prediccion_resumida: dict) -> dict:
     # --- Alineaciones (SofaScore) ---
     ss = datos_resumidos.get("_sofascore", {})
     _apply_sofascore_features(features, ss)
+    _apply_lineup_absence_features(features, ss)
     lineups = ss.get("alineaciones", {})
-    features["lineup_confirmed"] = 1 if lineups.get("local", {}).get("confirmada") else 0
+    lineup_sides = [side for side in [lineups.get("local", {}), lineups.get("visitante", {})] if side]
+    features["lineup_confirmed"] = 1 if lineup_sides and all(
+        side.get("confirmada") for side in lineup_sides
+    ) else 0
 
     # --- Tabla de posiciones / contexto ---
     standings = datos_resumidos.get("_standings", {})
@@ -247,7 +442,7 @@ def build_features(datos_resumidos: dict, prediccion_resumida: dict) -> dict:
     features["bsd_over25"] = prediccion_resumida.get("prob_over_25")
     features["bsd_btts"] = prediccion_resumida.get("prob_btts")
 
-    # --- Cuotas Betsafe ---
+    # --- Cuotas bookmaker ---
     cuotas = datos_resumidos.get("_cuotas", {})
     if not cuotas:
         cuotas = datos_resumidos.get("cuotas", {})
@@ -305,10 +500,48 @@ def project_goals(features: dict, league_avg_goals: float = 2.65) -> Dict[str, f
 
 def project_tiros(features: dict) -> Dict[str, float]:
     """Proyecta tiros totales y al arco."""
-    t_loc = _num(features.get("tiros_local_avg"), 12.0)
-    t_vis = _num(features.get("tiros_visitor_avg"), 10.0)
-    ta_loc = _num(features.get("tiros_arco_local_avg"), 4.0)
-    ta_vis = _num(features.get("tiros_arco_visitor_avg"), 3.0)
+    loc_attack = _best_split_value(
+        features, "local", "shots", "for",
+        ["current_home", "home", "current", "recent"],
+        features.get("tiros_local_avg"),
+    )
+    vis_conceded = _best_split_value(
+        features, "visitor", "shots", "against",
+        ["current_away", "away", "current", "recent"],
+    )
+    vis_attack = _best_split_value(
+        features, "visitor", "shots", "for",
+        ["current_away", "away", "current", "recent"],
+        features.get("tiros_visitor_avg"),
+    )
+    loc_conceded = _best_split_value(
+        features, "local", "shots", "against",
+        ["current_home", "home", "current", "recent"],
+    )
+
+    loc_sot_attack = _best_split_value(
+        features, "local", "sot", "for",
+        ["current_home", "home", "current", "recent"],
+        features.get("tiros_arco_local_avg"),
+    )
+    vis_sot_conceded = _best_split_value(
+        features, "visitor", "sot", "against",
+        ["current_away", "away", "current", "recent"],
+    )
+    vis_sot_attack = _best_split_value(
+        features, "visitor", "sot", "for",
+        ["current_away", "away", "current", "recent"],
+        features.get("tiros_arco_visitor_avg"),
+    )
+    loc_sot_conceded = _best_split_value(
+        features, "local", "sot", "against",
+        ["current_home", "home", "current", "recent"],
+    )
+
+    t_loc = _num(_blend_attack_defense(loc_attack, vis_conceded), 12.0)
+    t_vis = _num(_blend_attack_defense(vis_attack, loc_conceded), 10.0)
+    ta_loc = _num(_blend_attack_defense(loc_sot_attack, vis_sot_conceded), 4.0)
+    ta_vis = _num(_blend_attack_defense(vis_sot_attack, loc_sot_conceded), 3.0)
 
     # Ajuste por posición y forma
     pos_adj = 0.0
@@ -319,19 +552,44 @@ def project_tiros(features: dict) -> Dict[str, float]:
     proj_loc = max(5, t_loc + pos_adj)
     proj_vis = max(4, t_vis - pos_adj)
 
+    ta_loc_raw = max(1, ta_loc + pos_adj * 0.3)
+    ta_vis_raw = max(1, ta_vis - pos_adj * 0.3)
+    ta_loc_proj = _cap_sot_projection(ta_loc_raw, proj_loc, features, "local")
+    ta_vis_proj = _cap_sot_projection(ta_vis_raw, proj_vis, features, "visitor")
+
     return {
         "tiros_local": round(proj_loc, 1),
         "tiros_visitor": round(proj_vis, 1),
         "tiros_total": round(proj_loc + proj_vis, 1),
-        "tiros_arco_local": round(max(1, ta_loc + pos_adj * 0.3), 1),
-        "tiros_arco_visitor": round(max(1, ta_vis - pos_adj * 0.3), 1),
+        "tiros_arco_local": round(ta_loc_proj, 1),
+        "tiros_arco_visitor": round(ta_vis_proj, 1),
     }
 
 
 def project_corners(features: dict) -> Dict[str, float]:
     """Proyecta córners."""
-    corners_loc = features.get("corners_local_avg")
-    corners_vis = features.get("corners_visitor_avg")
+    corners_loc = _blend_attack_defense(
+        _best_split_value(
+            features, "local", "corners", "for",
+            ["current_home", "home", "current", "recent"],
+            features.get("corners_local_avg"),
+        ),
+        _best_split_value(
+            features, "visitor", "corners", "against",
+            ["current_away", "away", "current", "recent"],
+        ),
+    )
+    corners_vis = _blend_attack_defense(
+        _best_split_value(
+            features, "visitor", "corners", "for",
+            ["current_away", "away", "current", "recent"],
+            features.get("corners_visitor_avg"),
+        ),
+        _best_split_value(
+            features, "local", "corners", "against",
+            ["current_home", "home", "current", "recent"],
+        ),
+    )
     if corners_loc is not None and corners_vis is not None:
         base = corners_loc + corners_vis
     else:
@@ -355,28 +613,78 @@ def project_corners(features: dict) -> Dict[str, float]:
 
 def project_cards(features: dict) -> Dict[str, float]:
     """Proyecta tarjetas amarillas."""
-    yc_loc = _num(features.get("yc_local_avg"), 1.8)
-    yc_vis = _num(features.get("yc_visitor_avg"), 1.8)
+    loc_yc_own = _best_split_value(
+        features, "local", "yc", "for",
+        ["current_home", "home", "current", "recent"],
+        features.get("yc_local_avg"),
+    )
+    vis_yc_provoked = _best_split_value(
+        features, "visitor", "yc", "against",
+        ["current_away", "away", "current", "recent"],
+    )
+    vis_yc_own = _best_split_value(
+        features, "visitor", "yc", "for",
+        ["current_away", "away", "current", "recent"],
+        features.get("yc_visitor_avg"),
+    )
+    loc_yc_provoked = _best_split_value(
+        features, "local", "yc", "against",
+        ["current_home", "home", "current", "recent"],
+    )
+
+    yc_loc = _num(_blend_attack_defense(loc_yc_own, vis_yc_provoked, attack_weight=0.75), 1.8)
+    yc_vis = _num(_blend_attack_defense(vis_yc_own, loc_yc_provoked, attack_weight=0.75), 1.8)
 
     derby_adj = 1.2 if features.get("is_derby") else 0.0
     form_adj = abs(features.get("form_local_pts", 1.5) - features.get("form_visitor_pts", 1.5)) * 0.2
     travel_adj = 0.0001 * (features.get("travel_km") or 0)
 
     total = yc_loc + yc_vis + derby_adj + form_adj + travel_adj
+    if features.get("is_friendly"):
+        yc_loc *= 0.85
+        yc_vis *= 0.85
+        total *= 0.82
+    min_total = 1.4 if features.get("is_friendly") else 2.0
     return {
         "yc_local": round(max(0, yc_loc + derby_adj / 2), 1),
         "yc_visitor": round(max(0, yc_vis + derby_adj / 2 + travel_adj), 1),
-        "yc_total": round(max(2, total), 1),
+        "yc_total": round(max(min_total, total), 1),
     }
 
 
 def project_fouls(features: dict) -> Dict[str, float]:
-    """Proyecta faltas totales."""
-    f_loc = _num(features.get("fouls_local_avg"), 12.0)
-    f_vis = _num(features.get("fouls_visitor_avg"), 12.0)
+    """Proyecta faltas cometidas por equipo y totales."""
+    loc_committed = _best_split_value(
+        features, "local", "fouls", "for",
+        ["current_home", "home", "current", "recent"],
+        features.get("fouls_local_avg"),
+    )
+    vis_received = _best_split_value(
+        features, "visitor", "fouls", "against",
+        ["current_away", "away", "current", "recent"],
+    )
+    vis_committed = _best_split_value(
+        features, "visitor", "fouls", "for",
+        ["current_away", "away", "current", "recent"],
+        features.get("fouls_visitor_avg"),
+    )
+    loc_received = _best_split_value(
+        features, "local", "fouls", "against",
+        ["current_home", "home", "current", "recent"],
+    )
+
+    f_loc = _num(_blend_attack_defense(loc_committed, vis_received, attack_weight=0.7), 12.0)
+    f_vis = _num(_blend_attack_defense(vis_committed, loc_received, attack_weight=0.7), 12.0)
     derby_adj = 3.0 if features.get("is_derby") else 0.0
+    f_loc_proj = max(4, f_loc + derby_adj / 2)
+    f_vis_proj = max(4, f_vis + derby_adj / 2)
+    if features.get("is_friendly"):
+        f_loc_proj = max(4, f_loc_proj * 0.88)
+        f_vis_proj = max(4, f_vis_proj * 0.88)
     return {
-        "fouls": round(max(10, f_loc + f_vis + derby_adj), 1),
+        "fouls_local": round(f_loc_proj, 1),
+        "fouls_visitor": round(f_vis_proj, 1),
+        "fouls": round(max(10, f_loc_proj + f_vis_proj), 1),
     }
 
 

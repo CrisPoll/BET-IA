@@ -21,7 +21,7 @@ from bsd_client import (
 )
 from bsd_client_v2 import enriquecer_con_v2
 from sofascore_client import enriquecer_datos_partido, verificar_salud_sofascore, obtener_partidos_sofascore_only, obtener_datos_completos_sofascore
-from betsafe_client import obtener_cuotas_betsafe_desde_url
+from betano_client import obtener_cuotas_betano_desde_url
 from analyzer import analizar_partido
 import prediction_db as db
 from quant_model import run_full_projection
@@ -152,8 +152,20 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
             v2_parts.append("stats (shotmap, momentum, xg_per_minute)")
         if v2.get("metadata") and "_error" not in v2["metadata"]:
             v2_parts.append("metadata (facts, AI preview)")
+        lineups_v2 = v2.get("lineups", {})
+        if lineups_v2 and "_error" not in lineups_v2:
+            if lineups_v2.get("lineups") or lineups_v2.get("unavailable_players"):
+                v2_parts.append("lineups BSD")
+            elif lineups_v2.get("lineup_status"):
+                v2_parts.append("lineup status BSD")
         if v2.get("player_stats") and "_error" not in v2["player_stats"]:
             v2_parts.append("player-stats")
+        if v2.get("player_impact") and "_error" not in v2["player_impact"]:
+            v2_parts.append("impacto jugadores")
+        if v2.get("odds") and "_error" not in v2["odds"]:
+            v2_parts.append("odds consenso")
+        if v2.get("motivation"):
+            v2_parts.append("motivación/fixtures")
         if v2.get("standings") and "_error" not in v2["standings"]:
             v2_parts.append("standings (xG)")
         if v2_parts:
@@ -185,13 +197,13 @@ def _cargar_datos_partido(partido: dict, verbose: bool = True):
         print(f"  ⚠ SofaScore no disponible: {e}")
 
     try:
-        print(f"     Pega la URL de Betsafe (Enter para omitir):")
+        print(f"     Pega la URL de Betano (Enter para omitir):")
         url = input("     > ").strip()
         if url:
-            cuotas = obtener_cuotas_betsafe_desde_url(url)
+            cuotas = obtener_cuotas_betano_desde_url(url)
             if cuotas and "error" not in cuotas and cuotas.get("markets"):
                 datos_resumidos["_cuotas"] = cuotas
-                print(f"     ✓ Betsafe: {len(cuotas.get('markets', {}))} mercados en tiempo real")
+                print(f"     ✓ Betano: {len(cuotas.get('markets', {}))} mercados en tiempo real")
             else:
                 print(f"     ✗ Error: {cuotas.get('error', '?')}")
     except Exception:
@@ -316,8 +328,8 @@ def main():
                 _separador()
                 from analyzer import SYSTEM_PROMPT, _crear_prompt_usuario
                 from quant_model import run_full_projection
-                qp, _ = run_full_projection(datos, prediccion)
-                user_prompt = _crear_prompt_usuario(datos, prediccion, qp)
+                qp, features = run_full_projection(datos, prediccion)
+                user_prompt = _crear_prompt_usuario(datos, prediccion, qp, features)
                 print(f"=== SYSTEM PROMPT ({len(SYSTEM_PROMPT)} chars) ===")
                 print(SYSTEM_PROMPT)
                 print(f"\n=== USER PROMPT ({len(user_prompt)} chars) ===")

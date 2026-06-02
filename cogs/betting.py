@@ -1,6 +1,10 @@
 import asyncio
 import logging
+import os
 import re
+import time
+from pathlib import Path
+
 import discord
 from discord.ext import commands
 
@@ -13,13 +17,56 @@ from bsd_client import (
 )
 from bsd_client_v2 import enriquecer_con_v2
 from sofascore_client import enriquecer_datos_partido as enriquecer_sofascore, verificar_salud_sofascore, obtener_partidos_sofascore_only, obtener_datos_completos_sofascore
-from betsafe_client import obtener_cuotas_betsafe_desde_url
+from betano_client import obtener_cuotas_betano_desde_url
 from analyzer import analizar_partido
 
 logger = logging.getLogger(__name__)
 
 PER_PAGE = 25
 DISCORD_MSG_LIMIT = 2000
+ANALYSIS_LOCK_DIR = Path("output") / "locks"
+ANALYSIS_LOCK_TTL_SECONDS = 45 * 60
+
+
+def _analysis_lock_path(match_id: int) -> Path:
+    safe_id = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(match_id))
+    return ANALYSIS_LOCK_DIR / f"analysis_{safe_id}.lock"
+
+
+def _acquire_analysis_lock(match_id: int) -> Path | None:
+    ANALYSIS_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = _analysis_lock_path(match_id)
+    payload = f"pid={os.getpid()}\ntime={time.time()}\nmatch_id={match_id}\n"
+
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            age = time.time() - lock_path.stat().st_mtime
+        except OSError:
+            age = 0
+        if age > ANALYSIS_LOCK_TTL_SECONDS:
+            try:
+                lock_path.unlink()
+            except OSError:
+                return None
+            return _acquire_analysis_lock(match_id)
+        return None
+
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(payload)
+    return lock_path
+
+
+def _release_analysis_lock(lock_path: Path | None):
+    if not lock_path:
+        return
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("No se pudo liberar lock de analisis: %s", lock_path)
 
 
 def _split_response(text: str, limit: int = DISCORD_MSG_LIMIT) -> list:
@@ -36,17 +83,17 @@ def _split_response(text: str, limit: int = DISCORD_MSG_LIMIT) -> list:
 
 
 def _parse_urls(args: str) -> tuple:
-    """Parsea URLs de Betsafe y arbitro desde string de argumentos."""
-    betsafe_url = ""
+    """Parsea URLs de Betano y arbitro desde string de argumentos."""
+    betano_url = ""
     arbitro_url = ""
     words = args.strip().split()
     for w in words:
         w = w.strip()
-        if "betsafe" in w:
-            betsafe_url = w
+        if "betano" in w:
+            betano_url = w
         elif any(site in w for site in ("whoscored", "transfermarkt", "sofascore")):
             arbitro_url = w
-    return betsafe_url, arbitro_url
+    return betano_url, arbitro_url
 
 
 class MatchSelectView(discord.ui.View):
@@ -116,8 +163,8 @@ class MatchSelectView(discord.ui.View):
             content=(
                 f"**{local} vs {visitante}** (ID: `{match_id}`)\n"
                 f"Usa el comando:\n"
-                f"`!a {match_id} <url_betsafe> <url_arbitro>`\n"
-                f"Ejemplo: `!a {match_id} https://www.betsafe.pe/...?eventId=f-... https://es.whoscored.com/referees/...`"
+                f"`!a {match_id} <url_betano> <url_arbitro>`\n"
+                f"Ejemplo: `!a {match_id} https://www.betano.pe/cuotas-de-partido/... https://es.whoscored.com/referees/...`"
             ),
             view=None,
         )
@@ -137,6 +184,7 @@ class BettingCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._match_cache: list = []
+        self._active_analyses: set[int] = set()
 
     @commands.command(name="partidos", aliases=["p"])
     async def partidos(self, ctx: commands.Context):
@@ -168,49 +216,63 @@ class BettingCog(commands.Cog):
 
     @commands.command(name="analizar", aliases=["a"])
     async def analizar(self, ctx: commands.Context, match_id: int, *, args: str = ""):
-        betsafe_url, arbitro_url = _parse_urls(args) if args else ("", "")
-
-        # Buscar en el cache para saber si es SofaScore-only
-        cached = None
-        for m in self._match_cache:
-            if m.get("id") == match_id:
-                cached = m
-                break
-
-        # Si el cache dice que es SofaScore-only, usar ese flujo directamente
-        if cached and cached.get("_source") == "sofascore_only":
-            async with ctx.typing():
-                await self._analyze_match(ctx, cached, betsafe_url, arbitro_url)
+        if match_id in self._active_analyses:
+            await ctx.send(f"Ya hay un análisis en curso para el partido `{match_id}`.")
             return
 
-        async with ctx.typing():
-            try:
-                detalle = obtener_detalle_partido(match_id)
-            except Exception as e:
-                # Si BSD falla (404) y no lo encontramos en cache, intentar con SofaScore
-                if cached:
-                    await self._analyze_match(ctx, cached, betsafe_url, arbitro_url)
-                    return
-                await ctx.send(
-                    f"\u274c Error al obtener el partido {match_id}: {e}\n"
-                    f"Si es un partido de una liga no cubierta por BSD, usa `!partidos` primero y volve a intentar."
-                )
+        lock_path = _acquire_analysis_lock(match_id)
+        if lock_path is None:
+            await ctx.send(f"Ya hay un análisis en curso para el partido `{match_id}`.")
+            return
+
+        self._active_analyses.add(match_id)
+        betano_url, arbitro_url = _parse_urls(args) if args else ("", "")
+
+        try:
+            # Buscar en el cache para saber si es SofaScore-only
+            cached = None
+            for m in self._match_cache:
+                if m.get("id") == match_id:
+                    cached = m
+                    break
+
+            # Si el cache dice que es SofaScore-only, usar ese flujo directamente
+            if cached and cached.get("_source") == "sofascore_only":
+                async with ctx.typing():
+                    await self._analyze_match(ctx, cached, betano_url, arbitro_url)
                 return
 
-            local = detalle.get("home_team", "?")
-            visitante = detalle.get("away_team", "?")
+            async with ctx.typing():
+                try:
+                    detalle = obtener_detalle_partido(match_id)
+                except Exception as e:
+                    # Si BSD falla (404) y no lo encontramos en cache, intentar con SofaScore
+                    if cached:
+                        await self._analyze_match(ctx, cached, betano_url, arbitro_url)
+                        return
+                    await ctx.send(
+                        f"\u274c Error al obtener el partido {match_id}: {e}\n"
+                        f"Si es un partido de una liga no cubierta por BSD, usa `!partidos` primero y volve a intentar."
+                    )
+                    return
 
-            match = {
-                "id": match_id,
-                "home_team": local,
-                "away_team": visitante,
-                "_league_name": detalle.get("_league_name") or detalle.get("league", {}).get("name", "?"),
-                "league": detalle.get("league", {}),
-            }
+                local = detalle.get("home_team", "?")
+                visitante = detalle.get("away_team", "?")
 
-            await self._analyze_match(ctx, match, betsafe_url, arbitro_url)
+                match = {
+                    "id": match_id,
+                    "home_team": local,
+                    "away_team": visitante,
+                    "_league_name": detalle.get("_league_name") or detalle.get("league", {}).get("name", "?"),
+                    "league": detalle.get("league", {}),
+                }
 
-    async def _analyze_match(self, channel, match: dict, betsafe_url: str = "", arbitro_url: str = ""):
+                await self._analyze_match(ctx, match, betano_url, arbitro_url)
+        finally:
+            self._active_analyses.discard(match_id)
+            _release_analysis_lock(lock_path)
+
+    async def _analyze_match(self, channel, match: dict, betano_url: str = "", arbitro_url: str = ""):
         match_id = match.get("id")
         local = match.get("home_team", "?")
         visitante = match.get("away_team", "?")
@@ -222,13 +284,13 @@ class BettingCog(commands.Cog):
         progress_msg = await channel.send(
             f"\u23f3 Analizando **{local} vs {visitante}**..."
         )
+        progress_lines = [progress_msg.content]
 
         async def _update(text: str):
             nonlocal step
             step += 1
-            lines = progress_msg.content.split("\n")
-            lines.append(f"\u25ab {step}/{total_steps} {text}")
-            await progress_msg.edit(content="\n".join(lines))
+            progress_lines.append(f"\u25ab {step}/{total_steps} {text}")
+            await progress_msg.edit(content="\n".join(progress_lines))
 
         datos_resumidos = None
         prediccion_resumida = {}
@@ -274,11 +336,11 @@ class BettingCog(commands.Cog):
                 except Exception:
                     pass
 
-            # Betsafe
-            if betsafe_url:
-                await _update("Obteniendo cuotas Betsafe...")
+            # Betano
+            if betano_url:
+                await _update("Obteniendo cuotas Betano...")
                 try:
-                    cuotas = await asyncio.to_thread(obtener_cuotas_betsafe_desde_url, betsafe_url)
+                    cuotas = await asyncio.to_thread(obtener_cuotas_betano_desde_url, betano_url)
                     if cuotas and "error" not in cuotas and cuotas.get("markets"):
                         datos_resumidos["_cuotas"] = cuotas
                 except Exception:
@@ -294,7 +356,7 @@ class BettingCog(commands.Cog):
                 except Exception:
                     pass
 
-            await _update("Consultando a DeepSeek...")
+            await _update("Consultando modelo IA...")
             analisis = await asyncio.to_thread(analizar_partido, datos_resumidos, prediccion_resumida)
 
         except Exception as e:

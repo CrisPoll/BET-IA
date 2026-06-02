@@ -1,131 +1,220 @@
 # Betting AI
 
-Sistema de análisis de value betting para fútbol, potenciado por DeepSeek V4 Pro via OpenRouter.
+Sistema de analisis de mercados estadisticos para futbol. Combina datos de BSD Sports Data, SofaScore y Betano con una proyeccion cuantitativa propia y un LLM via OpenRouter para generar analisis orientados a mercados como tiros, tiros al arco, corners, tarjetas, faltas y goles.
 
-Agrega datos de múltiples fuentes (BSD, SofaScore, Betsafe), aplica un **modelo predictivo cuantitativo propio** con regresión a la media y ajustes por contexto, envía todo a DeepSeek V4 Pro para generar proyecciones estadísticas y detectar oportunidades de valor en cuotas de apuestas. Incluye **persistencia SQLite**, **Kelly Criterion** para gestión de stakes, y **feedback loop** post-partido para medir MAE, ROI y calibración.
+> Este proyecto es una herramienta de analisis. No garantiza resultados ni debe tomarse como asesoramiento financiero.
 
-## Ligas cubiertas
+## Que Hace
 
-Brasileirao Serie A, Premier League, La Liga, Bundesliga, Serie A, Ligue 1, Champions League, Europa League, Copa Libertadores, Copa Sudamericana, mas ligas adicionales via SofaScore (sin requerir BSD).
+- Lista partidos cubiertos por las ligas configuradas en BSD y partidos extra desde SofaScore cuando aplica.
+- Enriquece cada partido con forma reciente, tabla, contexto competitivo, alineaciones, bajas, arbitro, H2H y estadisticas por partido.
+- Obtiene cuotas reales de Betano desde la URL publica del evento.
+- Genera una proyeccion base con `quant_model.py`.
+- Envia el contexto a OpenRouter para producir una lectura final en formato apto para Discord.
+- Guarda predicciones, resultados y apuestas en SQLite para medir MAE, ROI y calibracion.
 
-## Fuentes de datos
+## Fuentes De Datos
 
-| Fuente | Metodo | Datos |
-|---|---|---|---|
-| **BSD API v1** | REST API | Partidos, cuotas, predicciones ML (CatBoost), H2H, standings |
-| **BSD API v2** | REST API | xG/min, shotmap, momentum, metadata (derby, clima, viaje), player-stats, managers, arbitros |
-| **SofaScore** | API no oficial (curl_cffi) | Alineaciones, H2H detallado, form/performance, standings, stats de jugadores y equipo |
-| **Betsafe** | Playwright (headless) | Cuotas en tiempo real de todos los mercados |
-
-## Analisis de IA
-
-El modelo DeepSeek V4 Pro analiza y proyecta por equipo y por mitad:
-
-- Tiros totales y al arco
-- Goles por mitad (1T/2T)
-- Tarjetas amarillas
-- Corners
-- Faltas
-- Laterales
-
-Luego compara las proyecciones contra las cuotas reales de Betsafe para identificar valor esperado positivo.
+| Fuente | Uso Principal |
+|---|---|
+| BSD v1/v2 | Partidos, prediccion ML, stats, standings, fixtures, lineups de respaldo, odds comparativas |
+| SofaScore | Alineaciones, bajas, arbitro, tablas, H2H, forma reciente y estadisticas por partido |
+| Betano | Cuotas oficiales del partido y mercados estadisticos |
+| OpenRouter | Analisis contextual con LLM |
+| SQLite | Persistencia de predicciones, resultados y apuestas |
 
 ## Requisitos
 
 - Python 3.10+
-- Playwright browsers: `playwright install chromium`
+- Una API key de OpenRouter
+- Una API key de BSD Sports Data
+- Chromium de Playwright para leer cuotas de Betano
+- Token de Discord si quieres usar el bot
 
 ## Instalacion
 
 ```bash
-git clone <repo-url>
-cd betting-ai
+git clone https://github.com/CrisPoll/BET-IA.git
+cd BET-IA
 pip install -r requirements.txt
 playwright install chromium
-cp .env.example .env
-# Editar .env con tus API keys
+copy .env.example .env
 ```
 
-## Variables de entorno
+En Linux/macOS usa:
 
-| Variable | Requerida | Descripcion |
-|---|---|---|
-| `OPENROUTER_API_KEY` | Si | API key de OpenRouter |
-| `BSD_API_KEY` | Si | API key de BSD Sports Data |
-| `DISCORD_BOT_TOKEN` | No | Token del bot de Discord |
-| `DISCORD_HEALTH_WEBHOOK` | No | Webhook para alertas del health monitor |
-| `KELLY_FRACTION` | No | Fracción Kelly Criterion (default: 0.25) |
-| `BANKROLL_UNITS` | No | Bankroll base en unidades (default: 1000) |
+```bash
+cp .env.example .env
+```
 
-## Uso
+Luego completa `.env`:
 
-### Consola interactiva
+```env
+OPENROUTER_API_KEY=<openrouter-api-key>
+OPENROUTER_MODEL=anthropic/claude-opus-4.8
+BSD_API_KEY=<bsd-api-key>
+DISCORD_BOT_TOKEN=<discord-bot-token>
+```
+
+Variables opcionales:
+
+```env
+DISCORD_HEALTH_WEBHOOK=<discord-webhook-url>
+KELLY_FRACTION=0.25
+BANKROLL_UNITS=1000
+```
+
+## Uso Por Consola
+
+Ejecuta el menu principal:
 
 ```bash
 python main.py
 ```
 
-Menu interactivo para cargar partidos, seleccionar uno y ejecutar el analisis completo con IA. Opcionalmente acepta `--show-prompt` para mostrar el prompt sin llamar a la API.
+Flujo recomendado:
 
-### Bot de Discord
+1. Elige `Ver proximos partidos`.
+2. Elige `Seleccionar partido y analizar`.
+3. Pega la URL completa del evento de Betano cuando el programa la solicite.
+4. Revisa el analisis final y las recomendaciones.
+
+Para ver el prompt sin llamar al LLM:
 
 ```bash
-python bot.py
+python main.py --show-prompt
 ```
 
-Comandos:
-- `!partidos` / `!p` — Lista partidos con selector paginado
-- `!analizar <id> [url_betsafe] [url_arbitro]` / `!a` — Analiza un partido
-
-### Ver prompt
+Tambien puedes usar:
 
 ```bash
 python show_prompt.py
 ```
 
-Muestra el prompt completo enviado a la IA sin consumir la API.
+Opciones utiles de `show_prompt.py`:
 
-### Feedback loop — Registrar resultados post-partido
+```bash
+python show_prompt.py --save=prompt.txt
+python show_prompt.py --no-color
+python show_prompt.py --help
+```
+
+## Uso Con Discord
+
+Primero aseguralo en `.env`:
+
+```env
+DISCORD_BOT_TOKEN=<discord-bot-token>
+OPENROUTER_API_KEY=<openrouter-api-key>
+BSD_API_KEY=<bsd-api-key>
+```
+
+Arranca el bot:
+
+```bash
+python bot.py
+```
+
+Comandos disponibles:
+
+```text
+!partidos
+!p
+!analizar <id> [url_betano] [url_arbitro]
+!a <id> [url_betano] [url_arbitro]
+```
+
+Ejemplo:
+
+```text
+!a 9335 https://www.betano.pe/cuotas-de-partido/...
+```
+
+El bot usa locks en `output/locks` para evitar dos analisis simultaneos del mismo partido.
+
+## Registrar Resultados
+
+Despues del partido puedes cargar el resultado real y evaluar apuestas:
 
 ```bash
 python post_match.py
 ```
 
-Menú interactivo para:
-- Registrar resultados reales de un partido (goles, tiros, corners, tarjetas, faltas)
-- Evaluar apuestas realizadas (ganada/perdida/push)
-- Ver predicciones pendientes de resultado
+Esto actualiza la base SQLite en `output/predictions.db` y permite calcular:
 
-Toda la información se guarda en `output/predictions.db` y se usa para calcular automáticamente:
-- **MAE** (Mean Absolute Error) por métrica
-- **Log-loss** y calibración de probabilidades
-- **ROI** por mercado y global
+- MAE por metrica
+- ROI por mercado
+- calibracion de probabilidades
+- historial de predicciones recientes
 
-## Cómo funciona el análisis (v2)
+## Ligas Soportadas
 
-1. **Recolección de datos**: se junta información de BSD v1/v2, SofaScore y Betsafe.
-2. **Modelo cuantitativo (`quant_model.py`)**: genera una proyección base usando xG, forma ponderada, posición en tabla, distancia de viaje, regresión a la media y Poisson simplificado.
-3. **LLM (DeepSeek V4 Pro)**: recibe la base cuantitativa + contexto cualitativo y emite proyecciones numéricas ajustadas con detección de valor contra cuotas.
-4. **Persistencia (`prediction_db.py`)**: se guardan proyecciones, cuotas, stakes y features.
-5. **Post-partido (`post_match.py`)**: se ingresan resultados reales y el sistema calcula errores y ROI automáticamente.
+Las competiciones activas se definen en `competition_config.py`.
 
-## Estructura
+Actualmente el flujo principal cubre:
 
-```
+- Brasileirao Serie A
+- Premier League
+- La Liga
+- Bundesliga
+- Serie A
+- Ligue 1
+- Champions League
+- Europa League
+- Copa Libertadores
+- Copa Sudamericana
+- World Cup 2026
+- International Friendly Games
+
+SofaScore se usa para enriquecer datos. El universo principal de ligas lo define BSD.
+
+## Estructura Del Proyecto
+
+```text
 betting-ai/
-├── main.py                # Entrada por consola (con menú de performance)
-├── post_match.py          # CLI para registrar resultados y calcular métricas
-├── bot.py                 # Entrada del bot de Discord
-├── analyzer.py            # Prompt monolítico + DeepSeek + integración cuantitativa
-├── quant_model.py         # Modelo predictivo base (xG, forma, regresión, Poisson)
-├── bankroll.py            # Kelly Criterion, calibración y recomendación de stakes
-├── prediction_db.py       # SQLite: predicciones, resultados, apuestas, errores
-├── bsd_client.py          # BSD API v1
-├── bsd_client_v2.py       # BSD API v2
-├── sofascore_client.py    # SofaScore
-├── betsafe_client.py      # Betsafe (cuotas)
-├── utils.py               # Normalización de nombres de equipos
-├── cogs/                  # Comandos de Discord
-├── output/                # Datos cacheados + base SQLite
-└── requirements.txt
+|-- main.py                # CLI principal
+|-- show_prompt.py         # Vista del prompt y capas de datos sin llamar al LLM
+|-- bot.py                 # Entrada del bot de Discord
+|-- cogs/betting.py        # Comandos de Discord y locks de analisis
+|-- analyzer.py            # Prompt, armado de contexto y llamada OpenRouter
+|-- quant_model.py         # Proyeccion cuantitativa base
+|-- bankroll.py            # Kelly, calibracion y evaluacion de mercados
+|-- prediction_db.py       # Persistencia SQLite
+|-- bsd_client.py          # Cliente BSD base
+|-- bsd_client_v2.py       # Enriquecimiento BSD v2
+|-- sofascore_client.py    # Cliente SofaScore
+|-- betano_client.py       # Extraccion de cuotas Betano
+|-- competition_config.py  # Registro central de ligas/torneos
+|-- tests/                 # Pruebas unitarias
+|-- output/                # DB, locks y archivos locales ignorados por git
+`-- requirements.txt
 ```
+
+## Pruebas Y Validacion
+
+Ejecuta las pruebas unitarias:
+
+```bash
+python -m unittest discover -s tests
+```
+
+Valida sintaxis de los modulos principales:
+
+```bash
+python -m py_compile competition_config.py analyzer.py quant_model.py sofascore_client.py betano_client.py bsd_client.py bsd_client_v2.py cogs\betting.py main.py show_prompt.py
+```
+
+En PowerShell, si quieres reiniciar el bot y evitar procesos duplicados:
+
+```powershell
+Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'python|py' -and $_.CommandLine -match 'bot.py' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+Start-Process -FilePath python -ArgumentList '.\bot.py' -WorkingDirectory 'D:\Projects\NuevoAgenIa\betting-ai' -WindowStyle Hidden
+```
+
+## Seguridad
+
+- No subas `.env`.
+- Usa `.env.example` solo con placeholders.
+- Si alguna API key se imprime o se comparte por error, rotala.
+- `output/` contiene datos locales y esta ignorado por git.
+- `README.local.md` queda reservado para notas internas de trabajo y no se publica.
