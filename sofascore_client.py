@@ -1388,9 +1388,24 @@ def _score_impacto_baja_sofascore(
         razones.append(f"valor {_formatear_valor_mercado(market_value, currency)}")
 
     minutes_base = max(minutes, recent.get("minutes_total") or 0)
-    per90 = lambda value: (_to_float_or_none(value) or 0.0) * 90 / minutes_base if minutes_base else None
+
+    def per90(value):
+        number = _to_float_or_none(value)
+        return number * 90 / minutes_base if number is not None and minutes_base else None
     goals = _to_int_or_zero(stats.get("goals"))
     assists = _to_int_or_zero(stats.get("assists") or stats.get("goalAssist"))
+    shots_total = _to_float_or_none(stats.get("totalShots"))
+    sot_total = _to_float_or_none(stats.get("shotsOnTarget") or stats.get("onTargetScoringAttempt"))
+    xg_total = _to_float_or_none(stats.get("expectedGoals"))
+    xa_total = _to_float_or_none(stats.get("expectedAssists"))
+    key_total = _to_float_or_none(stats.get("keyPasses") or stats.get("keyPass"))
+    crosses_total = _to_float_or_none(stats.get("accurateCrosses") or stats.get("accurateCross"))
+    fouls_total = _to_float_or_none(stats.get("fouls"))
+    yellow_total = _to_float_or_none(stats.get("yellowCards") or stats.get("yellowCard"))
+    tackles_total = _to_float_or_none(stats.get("tackles") or stats.get("totalTackle"))
+    interceptions_total = _to_float_or_none(stats.get("interceptions") or stats.get("interceptionWon"))
+    saves_total = _to_float_or_none(stats.get("saves"))
+
     shots90 = per90(stats.get("totalShots"))
     sot90 = per90(stats.get("shotsOnTarget") or stats.get("onTargetScoringAttempt"))
     xg90 = per90(stats.get("expectedGoals"))
@@ -1450,11 +1465,76 @@ def _score_impacto_baja_sofascore(
 
     # Mantener el prompt compacto y accionable.
     razones = [r for r in razones if r][:4]
+    has_stats_context = bool(
+        minutes
+        or count_rating
+        or recent_sample
+        or rating is not None
+        or recent_rating is not None
+        or any(
+            value is not None
+            for value in (
+                shots_total,
+                sot_total,
+                xg_total,
+                xa_total,
+                key_total,
+                crosses_total,
+                fouls_total,
+                yellow_total,
+                tackles_total,
+                interceptions_total,
+                saves_total,
+            )
+        )
+    )
+    stats_resumen = {
+        "sample_recent": recent_sample,
+        "apps_recent": recent_apps,
+        "avg_minutes_recent": recent_avg_minutes,
+        "apps": count_rating or recent_apps or None,
+        "minutes": minutes or recent.get("minutes_total") or None,
+        "avg_rating": rating if rating is not None else recent_rating,
+        "goals": goals,
+        "assists": assists,
+        "shots": _round_or_none(shots_total),
+        "shots_p90": _round_or_none(shots90),
+        "shots_on_target": _round_or_none(sot_total),
+        "shots_on_target_p90": _round_or_none(sot90),
+        "xg": _round_or_none(xg_total),
+        "xg_p90": _round_or_none(xg90),
+        "xa": _round_or_none(xa_total),
+        "xa_p90": _round_or_none(xa90),
+        "key_passes": _round_or_none(key_total),
+        "key_passes_p90": _round_or_none(key90),
+        "accurate_crosses": _round_or_none(crosses_total),
+        "accurate_crosses_p90": _round_or_none(crosses90),
+        "fouls": _round_or_none(fouls_total),
+        "fouls_p90": _round_or_none(per90(fouls_total)),
+        "yellow_cards": _round_or_none(yellow_total),
+        "yellow_cards_p90": _round_or_none(per90(yellow_total)),
+        "tackles": _round_or_none(tackles_total),
+        "interceptions": _round_or_none(interceptions_total),
+        "defensive_actions_p90": _round_or_none(defensive90),
+        "saves": _round_or_none(saves_total),
+        "saves_p90": _round_or_none(saves90),
+    }
+    stats_resumen = {k: v for k, v in stats_resumen.items() if v is not None}
+    if has_stats_context and stats_resumen:
+        stats_resumen["source"] = "SofaScore temporada actual"
+    else:
+        stats_resumen = {}
     return {
         "nivel": nivel,
         "score": round(score, 1),
         "razones": razones,
+        "stats_resumen": stats_resumen,
     }
+
+
+def _round_or_none(value, digits: int = 2):
+    number = _to_float_or_none(value)
+    return round(number, digits) if number is not None else None
 
 
 def _resumir_attribute_edge(attrs: dict) -> str | None:
@@ -2086,6 +2166,119 @@ def _formatear_xi_impact_sofascore_para_prompt(datos: dict) -> str:
             partes.extend(f"    - {a}" for a in alertas[:3])
 
     return "\n".join(partes) if any_content else ""
+
+
+def _formatear_player_avgs_sofascore_para_prompt(datos: dict) -> str:
+    """Formatea medias de temporada por jugador desde SofaScore para el prompt."""
+    sofas = datos.get("_sofascore", {})
+    alin = sofas.get("alineaciones", {}) if sofas.get("disponible") else {}
+    if not alin:
+        return ""
+
+    local_team = datos.get("partido", "").split(" vs ")[0] if " vs " in datos.get("partido", "") else "Local"
+    away_team = datos.get("partido", "").split(" vs ")[1] if " vs " in datos.get("partido", "") else "Visitante"
+
+    partes = ["\n### MEDIAS POR JUGADOR (SofaScore)"]
+    partes.append(
+        "Base: temporada/torneo actual cuando SofaScore la entrega. "
+        "Las medias /90 usan minutos jugados; si la alineacion es preliminar, leer como probable XI."
+    )
+
+    any_content = False
+    for side, team_name in [("local", local_team), ("visitante", away_team)]:
+        team = alin.get(side, {}) or {}
+        starters = team.get("titulares", []) or []
+        rows = [
+            _linea_media_jugador_sofascore(p)
+            for p in starters
+            if (p.get("impacto_jugador") or {}).get("stats_resumen")
+        ]
+        bajas = (team.get("bajas") or {})
+        missing_rows = []
+        for bucket, label in [("confirmadas", "baja"), ("dudas", "duda")]:
+            for player in bajas.get(bucket, []) or []:
+                if (player.get("impacto_baja") or {}).get("stats_resumen"):
+                    missing_rows.append(_linea_media_jugador_sofascore(player, impact_key="impacto_baja", estado=label))
+        if not rows and not missing_rows:
+            continue
+        any_content = True
+        confirmed = "CONFIRMADA" if team.get("confirmada") else "PRELIMINAR/POSIBLE"
+        if rows:
+            partes.append(f"\n**{team_name}** - titulares {confirmed}")
+            partes.extend(f"  - {row}" for row in rows[:11])
+        elif missing_rows:
+            partes.append(f"\n**{team_name}** - titulares {confirmed}")
+        if missing_rows:
+            partes.append("  Bajas/dudas con media:")
+            partes.extend(f"    - {row}" for row in missing_rows[:8])
+
+    if not any_content:
+        return ""
+    partes.append(
+        "Uso recomendado: para tiros de jugador/equipo mira tiros/90, SOT/90 y xG/90; "
+        "para corners/volumen mira creacion, key passes y centros; para tarjetas mira YC/90, faltas y acciones defensivas."
+    )
+    return "\n".join(partes)
+
+
+def _linea_media_jugador_sofascore(player: dict, impact_key: str = "impacto_jugador", estado: str = "") -> str:
+    stats = ((player.get(impact_key) or {}).get("stats_resumen") or {})
+    name = player.get("nombre") or player.get("name") or "?"
+    pos = player.get("posicion") or player.get("position") or "?"
+    prefix = f"{name} ({pos})"
+    if estado:
+        prefix += f" [{estado}]"
+
+    base = []
+    apps = stats.get("apps")
+    minutes = stats.get("minutes")
+    if apps or minutes:
+        base.append(f"{apps or '?'}PJ/{minutes or '?'}min")
+    if stats.get("avg_rating") is not None:
+        base.append(f"rating {_fmt_player_stat(stats.get('avg_rating'))}")
+    if stats.get("goals") is not None or stats.get("assists") is not None:
+        base.append(f"G/A {stats.get('goals', 0)}/{stats.get('assists', 0)}")
+
+    attack = []
+    if stats.get("shots_p90") is not None:
+        attack.append(f"tiros {_fmt_player_stat(stats.get('shots_p90'))}/90")
+    if stats.get("shots_on_target_p90") is not None:
+        attack.append(f"SOT {_fmt_player_stat(stats.get('shots_on_target_p90'))}/90")
+    if stats.get("xg_p90") is not None:
+        attack.append(f"xG {_fmt_player_stat(stats.get('xg_p90'))}/90")
+
+    creation = []
+    if stats.get("xa_p90") is not None:
+        creation.append(f"xA {_fmt_player_stat(stats.get('xa_p90'))}/90")
+    if stats.get("key_passes_p90") is not None:
+        creation.append(f"key {_fmt_player_stat(stats.get('key_passes_p90'))}/90")
+    if stats.get("accurate_crosses_p90") is not None:
+        creation.append(f"centros {_fmt_player_stat(stats.get('accurate_crosses_p90'))}/90")
+
+    discipline = []
+    if stats.get("yellow_cards_p90") is not None:
+        discipline.append(f"YC {_fmt_player_stat(stats.get('yellow_cards_p90'))}/90")
+    if stats.get("fouls_p90") is not None:
+        discipline.append(f"faltas {_fmt_player_stat(stats.get('fouls_p90'))}/90")
+    if stats.get("defensive_actions_p90") is not None:
+        discipline.append(f"def {_fmt_player_stat(stats.get('defensive_actions_p90'))}/90")
+    if stats.get("saves_p90") is not None:
+        discipline.append(f"atajadas {_fmt_player_stat(stats.get('saves_p90'))}/90")
+
+    sections = [" | ".join(part for part in base if part)]
+    for group in (attack, creation, discipline):
+        if group:
+            sections.append(", ".join(group))
+    return prefix + ": " + " | ".join(s for s in sections if s)
+
+
+def _fmt_player_stat(value) -> str:
+    number = _to_float_or_none(value)
+    if number is None:
+        return "-"
+    if number == int(number):
+        return str(int(number))
+    return f"{number:.2f}"
 
 
 def _linea_impacto_jugador_sofascore(player: dict, compact: bool = False) -> str:

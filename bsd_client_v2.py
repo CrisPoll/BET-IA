@@ -777,10 +777,10 @@ def _select_players_for_impact(players: list, max_per_team: int = 8) -> list:
             if count >= limit or len(selected) >= max_per_team:
                 break
 
-    add_group("F", 3)
-    add_group("M", 3)
-    add_group("D", 1)
     add_group("G", 1)
+    add_group("F", 3)
+    add_group("M", 4)
+    add_group("D", 4)
     for p in sorted(players, key=lambda x: (not x.get("starter"), x.get("name") or "")):
         if len(selected) >= max_per_team:
             break
@@ -788,6 +788,20 @@ def _select_players_for_impact(players: list, max_per_team: int = 8) -> list:
         if key not in seen:
             selected.append(p)
             seen.add(key)
+    return selected
+
+
+def _select_lineup_players_for_profile(players: list, max_per_team: int = 11) -> list:
+    selected = []
+    seen = set()
+    for p in sorted(players, key=lambda x: (not x.get("starter"), x.get("name") or "")):
+        if len(selected) >= max_per_team:
+            break
+        key = p.get("id") or _norm(p.get("name"))
+        if key in seen:
+            continue
+        selected.append(p)
+        seen.add(key)
     return selected
 
 
@@ -817,10 +831,15 @@ def _aggregate_player_stats(rows: list) -> dict:
         avg_rating = round(sum(v * w for v, w in zip(rating_values, rating_weights)) / sum(rating_weights), 2)
 
     xg = total("expected_goals", "xg")
+    xa = total("expected_assists", "xa")
     shots = total("total_shots", "shots")
+    shots_on_target = total("shots_on_target", "on_target_scoring_att", "on_target_scoring_attempt")
     key_passes = total("key_pass", "key_passes")
     yellow = total("yellow_card", "yellow_cards")
     saves = total("saves", "goalkeeper_saves")
+    tackles = total("total_tackle", "tackles")
+    interceptions = total("interception", "interceptions")
+    fouls = total("fouls", "fouls_committed")
 
     return {
         "apps": apps,
@@ -829,20 +848,26 @@ def _aggregate_player_stats(rows: list) -> dict:
         "goals": round(total("goals"), 2),
         "assists": round(total("goal_assist", "assists"), 2),
         "xg": round(xg, 2),
-        "xa": round(total("expected_assists", "xa"), 2),
+        "xa": round(xa, 2),
         "shots": round(shots, 2),
-        "shots_on_target": round(total("shots_on_target", "on_target_scoring_att"), 2),
+        "shots_on_target": round(shots_on_target, 2),
         "key_passes": round(key_passes, 2),
         "yellow_cards": round(yellow, 2),
         "red_cards": round(total("red_card", "red_cards"), 2),
         "saves": round(saves, 2),
-        "tackles": round(total("total_tackle", "tackles"), 2),
-        "interceptions": round(total("interception", "interceptions"), 2),
+        "tackles": round(tackles, 2),
+        "interceptions": round(interceptions, 2),
+        "fouls": round(fouls, 2),
         "xg_p90": per90(xg),
+        "xa_p90": per90(xa),
         "shots_p90": per90(shots),
+        "shots_on_target_p90": per90(shots_on_target),
         "key_passes_p90": per90(key_passes),
         "yellow_p90": per90(yellow),
         "saves_p90": per90(saves),
+        "tackles_p90": per90(tackles),
+        "interceptions_p90": per90(interceptions),
+        "fouls_p90": per90(fouls),
     }
 
 
@@ -901,7 +926,11 @@ def _build_player_impact(v2_data: dict, league_id: int = None, season_id: int = 
         source = "lineups" if players else "squad"
         if not players:
             players = _extract_squad_players(v2_data.get(squad_key, {}), side)
-        selected = _select_players_for_impact(players, max_per_team=8)
+        selected = (
+            _select_lineup_players_for_profile(players, max_per_team=11)
+            if source == "lineups"
+            else _select_players_for_impact(players, max_per_team=10)
+        )
         sources[side] = {"source": source, "players": selected}
         candidates.extend(selected)
 
@@ -1696,6 +1725,106 @@ def _impact_line(player: dict, mode: str = "attack") -> str:
     if mode == "creator":
         return f"{base}, key passes {stats.get('key_passes', 0)} ({stats.get('key_passes_p90', '-')}/90), asist {stats.get('assists', 0)}, xA {stats.get('xa', 0)}"
     return f"{base}, xG {stats.get('xg', 0)} ({stats.get('xg_p90', '-')}/90), tiros {stats.get('shots', 0)} ({stats.get('shots_p90', '-')}/90), goles {stats.get('goals', 0)}"
+
+
+def resumir_player_avgs_v2_para_prompt(datos_resumidos: dict, limit_per_team: int = 11) -> str:
+    """Lista medias generales por jugador desde BSD v2 para complementar SofaScore."""
+    v2 = datos_resumidos.get("_bsd_v2", {})
+    impact = v2.get("player_impact", {}) if isinstance(v2, dict) else {}
+    if not impact or "_error" in impact:
+        return ""
+
+    players = [
+        p for p in impact.get("players", [])
+        if p.get("source") != "unavailable"
+        and isinstance(p.get("stats"), dict)
+        and "_error" not in p.get("stats", {})
+        and p.get("stats")
+    ]
+    if not players:
+        return ""
+
+    local_team = datos_resumidos.get("partido", "").split(" vs ")[0] if " vs " in datos_resumidos.get("partido", "") else "Local"
+    away_team = datos_resumidos.get("partido", "").split(" vs ")[1] if " vs " in datos_resumidos.get("partido", "") else "Visitante"
+    side_names = {"home": local_team, "away": away_team}
+
+    partes = ["\n### MEDIAS POR JUGADOR (BSD v2)"]
+    if impact.get("season_id"):
+        partes.append(f"Base: ultimos partidos filtrados por temporada {impact.get('season_id')} cuando BSD los entrega; career como respaldo si no hay partido-a-partido.")
+    else:
+        partes.append("Base: ultimos partidos BSD; career como respaldo si no hay partido-a-partido.")
+
+    any_content = False
+    for side in ("home", "away"):
+        rows = [p for p in players if p.get("side") == side]
+        if not rows:
+            continue
+        any_content = True
+        rows.sort(key=lambda p: (not p.get("starter"), _pos_group(p.get("position")), p.get("name") or ""))
+        partes.append(f"\n**{side_names[side]}**")
+        for player in rows[:limit_per_team]:
+            partes.append(f"  - {_player_avg_line_v2(player)}")
+
+    if not any_content:
+        return ""
+    partes.append("Uso: tiros/90 y SOT/90 para volumen/calidad individual; xG/90 para amenaza; xA/key/90 para creacion; YC/90/faltas/90/duelos para tarjetas.")
+    return "\n".join(partes)
+
+
+def _player_avg_line_v2(player: dict) -> str:
+    stats = player.get("stats") or {}
+    role = "titular" if player.get("starter") else ("suplente" if player.get("substitute") else "plantilla")
+    if stats.get("career_fallback"):
+        role += ", career"
+
+    base = [f"{player.get('name', '?')} ({player.get('position', '?')}, {role})"]
+    apps = _stat(stats, "apps", "-")
+    minutes = _stat(stats, "minutes", "-")
+    rating = _stat(stats, "avg_rating", "-")
+    details = [f"{apps}p/{minutes}min"]
+    if rating != "-":
+        details.append(f"rating {_fmt_player_avg_v2(rating)}")
+    details.append(f"G/A {_fmt_player_avg_v2(stats.get('goals', 0))}/{_fmt_player_avg_v2(stats.get('assists', 0))}")
+
+    attack = []
+    if stats.get("shots_p90") is not None:
+        attack.append(f"tiros {_fmt_player_avg_v2(stats.get('shots_p90'))}/90")
+    if stats.get("shots_on_target_p90") is not None:
+        attack.append(f"SOT {_fmt_player_avg_v2(stats.get('shots_on_target_p90'))}/90")
+    if stats.get("xg_p90") is not None:
+        attack.append(f"xG {_fmt_player_avg_v2(stats.get('xg_p90'))}/90")
+
+    creation = []
+    if stats.get("xa_p90") is not None:
+        creation.append(f"xA {_fmt_player_avg_v2(stats.get('xa_p90'))}/90")
+    if stats.get("key_passes_p90") is not None:
+        creation.append(f"key {_fmt_player_avg_v2(stats.get('key_passes_p90'))}/90")
+
+    discipline = []
+    if stats.get("yellow_p90") is not None:
+        discipline.append(f"YC {_fmt_player_avg_v2(stats.get('yellow_p90'))}/90")
+    if stats.get("fouls_p90") is not None:
+        discipline.append(f"faltas {_fmt_player_avg_v2(stats.get('fouls_p90'))}/90")
+    defensive = (_stat(stats, "tackles_p90", 0) or 0) + (_stat(stats, "interceptions_p90", 0) or 0)
+    if defensive:
+        discipline.append(f"def {_fmt_player_avg_v2(defensive)}/90")
+    if stats.get("saves_p90") is not None:
+        discipline.append(f"atajadas {_fmt_player_avg_v2(stats.get('saves_p90'))}/90")
+
+    sections = [" | ".join(details)]
+    for group in (attack, creation, discipline):
+        if group:
+            sections.append(", ".join(group))
+    return f"{base[0]}: " + " | ".join(sections)
+
+
+def _fmt_player_avg_v2(value) -> str:
+    num = _to_float(value)
+    if num is None:
+        return "-"
+    if num == int(num):
+        return str(int(num))
+    return f"{num:.2f}"
 
 
 def resumir_player_impact_v2_para_prompt(datos_resumidos: dict) -> str:

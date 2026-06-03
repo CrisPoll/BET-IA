@@ -8,9 +8,11 @@ Sistema de analisis de mercados estadisticos para futbol. Combina datos de BSD S
 
 - Lista partidos cubiertos por las ligas configuradas en BSD y partidos extra desde SofaScore cuando aplica.
 - Enriquece cada partido con forma reciente, tabla, contexto competitivo, alineaciones, bajas, arbitro, H2H y estadisticas por partido.
-- Obtiene cuotas reales de Betano desde la URL publica del evento.
+- Agrega medias por jugador cuando hay datos: tiros/90, tiros al arco/90, xG/90, xA/90, key passes, tarjetas, faltas, acciones defensivas y atajadas.
+- Obtiene cuotas reales de Betano desde la URL publica del evento, incluyendo remates/tiros al arco de jugador cuando estan disponibles.
 - Genera una proyeccion base con `quant_model.py`.
 - Envia el contexto a OpenRouter para producir una lectura final en formato apto para Discord.
+- Clasifica cada pick recomendado con stake fijo de 5, 10 o 15 unidades segun fuerza del edge.
 - Guarda predicciones, resultados y apuestas en SQLite para medir MAE, ROI y calibracion.
 
 ## Fuentes De Datos
@@ -19,6 +21,7 @@ Sistema de analisis de mercados estadisticos para futbol. Combina datos de BSD S
 |---|---|
 | BSD v1/v2 | Partidos, prediccion ML, stats, standings, fixtures, lineups de respaldo, odds comparativas |
 | SofaScore | Alineaciones, bajas, arbitro, tablas, H2H, forma reciente y estadisticas por partido |
+| BSD v2 jugadores | Medias recientes por jugador y respaldo de plantillas/alineaciones |
 | Betano | Cuotas oficiales del partido y mercados estadisticos |
 | OpenRouter | Analisis contextual con LLM |
 | SQLite | Persistencia de predicciones, resultados y apuestas |

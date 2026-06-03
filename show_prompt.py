@@ -84,6 +84,8 @@ def _resumir_capas_datos(datos: dict) -> list[str]:
                 ss_parts.append("impacto bajas")
             if _has_sofascore_xi_impact(ss.get("alineaciones")):
                 ss_parts.append("impacto XI")
+            if _has_sofascore_player_avgs(ss.get("alineaciones")):
+                ss_parts.append("medias jugadores")
         ss_parts.extend(
             name for name in ["h2h", "detalle_evento", "form_performance", "standings"]
             if ss.get(name)
@@ -133,6 +135,17 @@ def _has_sofascore_xi_impact(alineaciones: dict) -> bool:
     for side in ("local", "visitante"):
         for player in (alineaciones.get(side) or {}).get("titulares", []) or []:
             if player.get("impacto_jugador"):
+                return True
+    return False
+
+
+def _has_sofascore_player_avgs(alineaciones: dict) -> bool:
+    if not isinstance(alineaciones, dict):
+        return False
+    for side in ("local", "visitante"):
+        team = alineaciones.get(side) or {}
+        for player in team.get("titulares", []) or []:
+            if ((player.get("impacto_jugador") or {}).get("stats_resumen")):
                 return True
     return False
 

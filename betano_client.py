@@ -123,8 +123,52 @@ def _team_prefix(name: str, home_team: str = "", away_team: str = "") -> bool:
     return False
 
 
+FULL_MATCH_STAT_MARKET_NAMES = {
+    "remates totales",
+    "tiros al arco",
+    "total de faltas cometidas",
+    "total de faltas",
+    "faltas totales",
+    "mas/menos corners",
+    "corners en primer tiempo mas/menos",
+    "corners en segundo tiempo mas/menos",
+    "tarjetas totales mas/menos",
+    "total de tarjetas rojas",
+}
+
+PLAYER_SHOT_MARKERS = (
+    " remates totales",
+    " tiros al arco",
+    " remates al arco",
+    " tiros a puerta",
+    " shots on target",
+    " total shots",
+)
+
+
+def _is_player_shots_market(name: str, home_team: str = "", away_team: str = "") -> bool:
+    """Props de jugador que si queremos conservar: remates y tiros al arco."""
+    raw = name or ""
+    n = _norm(raw)
+    if _team_prefix(raw, home_team, away_team) or n in FULL_MATCH_STAT_MARKET_NAMES:
+        return False
+
+    bracketed = "[" in raw and "]" in raw
+    if bracketed and any(token in n for token in ("remates", "tiros al arco", "shots")):
+        return True
+    return any(marker in n for marker in PLAYER_SHOT_MARKERS)
+
+
+def _is_player_shots_table_market(name: str) -> bool:
+    """Mercados tabla donde cada fila es un jugador y el nombre base es la estadistica."""
+    n = _norm(name)
+    if any(token in n for token in ("falta", "tarjeta", "asistencia", "fuera de juego")):
+        return False
+    return any(token in n for token in ("remates", "tiros al arco", "remates al arco", "tiros a puerta", "shots"))
+
+
 def _is_player_prop_market(name: str, home_team: str = "", away_team: str = "") -> bool:
-    """Betano mezcla props de jugador en tabs estadísticos; no sirven para picks generales/equipo."""
+    """Detecta props de jugador mezclados en tabs estadísticos."""
     raw = name or ""
     n = _norm(raw)
     if "[" in raw and "]" in raw:
@@ -132,19 +176,7 @@ def _is_player_prop_market(name: str, home_team: str = "", away_team: str = "") 
     if _team_prefix(raw, home_team, away_team):
         return False
 
-    full_match_names = {
-        "remates totales",
-        "tiros al arco",
-        "total de faltas cometidas",
-        "total de faltas",
-        "faltas totales",
-        "mas/menos corners",
-        "corners en primer tiempo mas/menos",
-        "corners en segundo tiempo mas/menos",
-        "tarjetas totales mas/menos",
-        "total de tarjetas rojas",
-    }
-    if n in full_match_names:
+    if n in FULL_MATCH_STAT_MARKET_NAMES:
         return False
 
     player_stat_markers = [
@@ -159,10 +191,42 @@ def _is_player_prop_market(name: str, home_team: str = "", away_team: str = "") 
     return any(marker in n for marker in player_stat_markers)
 
 
+def _is_unsupported_player_prop_market(name: str, home_team: str = "", away_team: str = "") -> bool:
+    """Filtra props de jugador que no queremos mandar al prompt por ahora."""
+    return (
+        _is_player_prop_market(name, home_team, away_team)
+        and not _is_player_shots_market(name, home_team, away_team)
+    )
+
+
+def _player_shots_stat_type(name: str) -> str:
+    n = _norm(name)
+    if "tiros al arco" in n or "remates al arco" in n or "tiros a puerta" in n or "on target" in n:
+        return "player_shots_on_target"
+    return "player_shots"
+
+
+def _extract_player_name_from_shots_market(name: str) -> str:
+    raw = name or ""
+    bracket = re.search(r"\[([^\]]+)\]", raw)
+    if bracket:
+        return bracket.group(1).strip()
+
+    cleaned = re.sub(
+        r"\b(remates totales|tiros al arco|remates al arco|tiros a puerta|total shots|shots on target)\b.*$",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    ).strip(" -:()")
+    return cleaned or raw
+
+
 def _categorize_betano_market(name: str, home_team: str = "", away_team: str = "") -> str:
     n = _norm(name)
     team_prefixed = _team_prefix(name, home_team, away_team)
 
+    if _is_player_shots_market(name, home_team, away_team):
+        return "Player Shots On Target" if _player_shots_stat_type(name) == "player_shots_on_target" else "Player Shots"
     if n == "resultado del partido":
         return "1X2"
     if "doble oportunidad" in n:
@@ -202,6 +266,7 @@ def _normalizar_selection(sel: dict) -> dict | None:
         "odd": odd,
         "handicap": line,
         "betRef": sel.get("betRef"),
+        "player_name": sel.get("_player_context"),
     }
 
 
@@ -231,37 +296,96 @@ def _should_split_market(category: str, selections: list[dict]) -> bool:
         "Team Fouls",
         "Match Stats",
         "Team Match Stats",
+        "Player Shots",
+        "Player Shots On Target",
     }:
         return True
     return any(_selection_side(s.get("label", "")) for s in selections)
 
 
-def _normalizar_market(raw: dict, home_team: str = "", away_team: str = "") -> list[dict]:
+def _looks_like_selection_label(value) -> bool:
+    text = str(value or "").strip()
+    if not text or len(text) > 80:
+        return False
+    n = _norm(text)
+    return bool(
+        re.search(r"\b\d+(\.\d+)?\+?$", n)
+        or any(token in n for token in ("mas", "menos", "over", "under"))
+        or re.search(r"\b(si|no)\b", n)
+    )
+
+
+def _context_from_node(node: dict, base_name: str, current: str = "") -> str:
+    context = current or node.get("_player_context") or ""
+    if context:
+        return context
+
+    base_norm = _norm(base_name)
+    for key in ("playerName", "player_name", "participantName", "participant", "competitorName"):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            nested = value.get("name") or value.get("label") or value.get("fullName")
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
+
+    for key in ("name", "label", "title", "fullName"):
+        value = node.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        value_norm = _norm(value)
+        if value_norm == base_norm:
+            continue
+        if _looks_like_selection_label(value):
+            continue
+        return value.strip()
+
+    return ""
+
+
+def _extract_raw_selections(raw: dict, base_name: str) -> list[dict]:
+    selections = []
+
+    def walk(node, context: str = ""):
+        if isinstance(node, dict):
+            node_context = _context_from_node(node, base_name, context)
+            if any(node.get(key) is not None for key in ("price", "odd", "odds")):
+                sel = dict(node)
+                if node_context and not sel.get("_player_context"):
+                    sel["_player_context"] = node_context
+                selections.append(sel)
+                return
+            for key, value in node.items():
+                if key in {"event", "events", "market", "markets"}:
+                    continue
+                walk(value, node_context)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, context)
+
+    for sel in raw.get("selections", []) or []:
+        walk(sel)
+
     if raw.get("tableLayout"):
-        return []
+        for key, value in raw.items():
+            if key in {"selections", "event", "events", "market", "markets"}:
+                continue
+            walk(value)
 
-    base_name = raw.get("name") or raw.get("label") or raw.get("type") or str(raw.get("id", ""))
-    if _is_player_prop_market(base_name, home_team, away_team):
-        return []
+    return selections
 
-    selections = [
-        s for s in (_normalizar_selection(sel) for sel in raw.get("selections", []) or [])
-        if s
-    ]
-    if not selections:
-        return []
 
-    category = _categorize_betano_market(base_name, home_team, away_team)
-    raw_id = str(raw.get("id") or raw.get("uniqueId") or base_name)
-    common = {
-        "type": raw.get("type"),
-        "typeId": raw.get("typeId"),
-        "marketTemplateId": raw.get("type"),
-        "category": category,
-    }
+def _market_common_without_line(common: dict) -> dict:
+    return {key: value for key, value in common.items() if key != "raw_line"}
+
+
+def _build_markets_from_selections(base_name: str, raw_id: str, common: dict, selections: list[dict]) -> list[dict]:
+    category = common.get("category", "Other")
+    output_common = _market_common_without_line(common)
 
     if not _should_split_market(category, selections):
-        line = _to_float(raw.get("handicap"))
+        line = _to_float(common.get("raw_line"))
         if line in (None, 0, 0.0) and category in {
             "Over/Under",
             "Corners",
@@ -271,6 +395,8 @@ def _normalizar_market(raw: dict, home_team: str = "", away_team: str = "") -> l
             "Team Fouls",
             "Match Stats",
             "Team Match Stats",
+            "Player Shots",
+            "Player Shots On Target",
         }:
             selection_lines = {
                 s.get("handicap")
@@ -280,7 +406,7 @@ def _normalizar_market(raw: dict, home_team: str = "", away_team: str = "") -> l
             if len(selection_lines) == 1:
                 line = float(next(iter(selection_lines)))
         return [{
-            **common,
+            **output_common,
             "id": raw_id,
             "name": _append_line(base_name, line) if line not in (None, 0, 0.0) else base_name,
             "line": line,
@@ -297,13 +423,78 @@ def _normalizar_market(raw: dict, home_team: str = "", away_team: str = "") -> l
 
     for line in sorted(grouped):
         markets.append({
-            **common,
+            **output_common,
             "id": f"{raw_id}:{_format_line(line)}",
             "name": _append_line(base_name, line),
             "line": line,
             "selections": grouped[line],
         })
     return markets
+
+
+def _normalizar_market(raw: dict, home_team: str = "", away_team: str = "") -> list[dict]:
+    base_name = raw.get("name") or raw.get("label") or raw.get("type") or str(raw.get("id", ""))
+    raw_selections = _extract_raw_selections(raw, base_name)
+    has_player_context = any(sel.get("_player_context") for sel in raw_selections)
+    is_player_table = bool(
+        raw.get("tableLayout")
+        and has_player_context
+        and _is_player_shots_table_market(base_name)
+        and not _team_prefix(base_name, home_team, away_team)
+    )
+
+    if raw.get("tableLayout") and not (_is_player_shots_market(base_name, home_team, away_team) or is_player_table):
+        return []
+
+    selections = [
+        s for s in (_normalizar_selection(sel) for sel in raw_selections)
+        if s
+    ]
+    if not selections:
+        return []
+
+    if _is_unsupported_player_prop_market(base_name, home_team, away_team) and not is_player_table:
+        return []
+
+    category = (
+        "Player Shots On Target" if _player_shots_stat_type(base_name) == "player_shots_on_target" else "Player Shots"
+    ) if is_player_table else _categorize_betano_market(base_name, home_team, away_team)
+    raw_id = str(raw.get("id") or raw.get("uniqueId") or base_name)
+    common = {
+        "type": raw.get("type"),
+        "typeId": raw.get("typeId"),
+        "marketTemplateId": raw.get("type"),
+        "category": category,
+        "raw_line": raw.get("handicap"),
+    }
+    if is_player_table:
+        markets = []
+        grouped_by_player: dict[str, list[dict]] = {}
+        for sel in selections:
+            player = sel.get("player_name")
+            if not player:
+                continue
+            grouped_by_player.setdefault(player, []).append(sel)
+        for player, player_selections in grouped_by_player.items():
+            player_common = {
+                **common,
+                "player_name": player,
+                "stat_type": _player_shots_stat_type(base_name),
+            }
+            player_base_name = f"{player} {base_name}".strip()
+            markets.extend(_build_markets_from_selections(
+                player_base_name,
+                f"{raw_id}:{_norm(player)}",
+                player_common,
+                player_selections,
+            ))
+        return markets
+
+    if category in {"Player Shots", "Player Shots On Target"}:
+        common["player_name"] = _extract_player_name_from_shots_market(base_name)
+        common["stat_type"] = _player_shots_stat_type(base_name)
+
+    return _build_markets_from_selections(base_name, raw_id, common, selections)
 
 
 def _extract_teams(event: dict) -> tuple[str, str]:
@@ -492,6 +683,16 @@ def _format_market(market: dict) -> str:
     return f"  {market.get('name', '?')}: {' | '.join(selections)}"
 
 
+def _format_player_shots_market(market: dict) -> str:
+    player = market.get("player_name") or _extract_player_name_from_shots_market(market.get("name", ""))
+    stat_label = "tiros al arco" if market.get("stat_type") == "player_shots_on_target" else "remates"
+    selections = []
+    for sel in (market.get("selections") or [])[:10]:
+        label = sel.get("label") or sel.get("name") or "?"
+        selections.append(f"{label}: @{sel.get('odd', '?')}")
+    return f"  {player} - {stat_label}: {' | '.join(selections)}"
+
+
 def _formatear_cuotas_betano_para_prompt(result: dict) -> str:
     """Formatea cuotas Betano para el prompt con foco en mercados estadisticos."""
     if not result or "error" in result or not result.get("markets"):
@@ -505,7 +706,7 @@ def _formatear_cuotas_betano_para_prompt(result: dict) -> str:
 
     markets = [
         m for m in result.get("markets", {}).values()
-        if not _is_player_prop_market(m.get("name", ""), result.get("home_team", ""), result.get("away_team", ""))
+        if not _is_unsupported_player_prop_market(m.get("name", ""), result.get("home_team", ""), result.get("away_team", ""))
     ]
     sections = [
         ("GANADOR", lambda m: m.get("category") == "1X2"),
@@ -514,6 +715,7 @@ def _formatear_cuotas_betano_para_prompt(result: dict) -> str:
         ("CORNERS", lambda m: m.get("category") in {"Corners", "Team Corners"} and _line_in(m, {8.5, 9.5, 10.5, 11.5})),
         ("TARJETAS", lambda m: m.get("category") == "Cards" and _line_in(m, {3.5, 4.5, 5.5})),
         ("TIROS", lambda m: m.get("category") in {"Match Stats", "Team Match Stats"}),
+        ("REMATES JUGADORES", lambda m: m.get("category") in {"Player Shots", "Player Shots On Target"}),
         ("FALTAS", lambda m: m.get("category") in {"Fouls", "Team Fouls"}),
     ]
 
@@ -524,8 +726,12 @@ def _formatear_cuotas_betano_para_prompt(result: dict) -> str:
         shown.sort(key=lambda m: (m.get("category", ""), m.get("name", ""), _market_line(m) or 999))
         parts.append(f"**{label}**")
         for market in shown[:24]:
-            parts.append(_format_market(market))
+            if market.get("category") in {"Player Shots", "Player Shots On Target"}:
+                parts.append(_format_player_shots_market(market))
+            else:
+                parts.append(_format_market(market))
         parts.append("")
 
     parts.append("IMPORTANTE: Cuotas oficiales de Betano en tiempo real.")
+    parts.append("Para REMATES JUGADORES, comparar contra MEDIAS POR JUGADOR y confirmar que el jugador sea titular/probable antes de recomendar.")
     return "\n".join(parts)

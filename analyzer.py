@@ -24,6 +24,7 @@ from sofascore_client import (
     _formatear_match_statistics_para_prompt,
     _formatear_team_season_stats_para_prompt,
     _formatear_xi_impact_sofascore_para_prompt,
+    _formatear_player_avgs_sofascore_para_prompt,
 )
 from betano_client import _formatear_cuotas_betano_para_prompt
 from competition_config import get_competition_flags
@@ -37,6 +38,7 @@ from bsd_client_v2 import (
     resumir_arbitro_v2_para_prompt,
     resumir_lineups_v2_para_prompt,
     resumir_player_impact_v2_para_prompt,
+    resumir_player_avgs_v2_para_prompt,
     resumir_odds_v2_para_prompt,
     resumir_motivacion_v2_para_prompt,
 )
@@ -117,20 +119,20 @@ Ejemplo I: Árbitro alto no basta para Over tarjetas
 Proyección correcta: 4-5 amarillas, no 6+ automático. Over tarjetas solo fuerte si árbitro + tensión + faltas + duelos coinciden.
 Justificación: el árbitro sube el piso, pero el guion del partido define si se llega al techo.
 
-Ejemplo J: Una buena proyección NO siempre es una buena apuesta
+Ejemplo J: Una buena proyección NO siempre es una apuesta fuerte
 Proyección: Total tarjetas 4.5-5.5. Línea: Over 4.5 @2.00.
-Decisión correcta: puede ser una lectura razonable, pero NO es pick fuerte si el rango empieza justo en la línea y depende de un solo factor (árbitro/final). Omitir o bajar a observación en vivo.
-Justificación: para recomendar prepartido con stake fijo 10, el margen debe ser claro y robusto. "Rango toca línea" no equivale a value.
+Decisión correcta: puede ser una lectura razonable, pero NO es stake 10/15 si el rango empieza justo en la línea y depende de un solo factor (árbitro/final). Puede ser stake 5 solo con apoyos adicionales claros; si no, omitir o bajar a observación en vivo.
+Justificación: "Rango toca línea" no equivale a value fuerte.
 
 Ejemplo K: No duplicar exposición en picks correlacionados
 Mercados: Over 3.5 tarjetas y Over 4.5 tarjetas en el mismo partido.
-Decisión correcta: NO recomendar ambos. Elegir una sola línea, o ninguna si el edge no justifica stake fijo 10.
+Decisión correcta: NO recomendar ambos. Elegir una sola línea y asignar stake 5/10/15 según edge real; si el edge es leve, omitir.
 Justificación: si falla la hipótesis del árbitro/ritmo, pierden ambos. El portfolio debe evitar duplicar el mismo guion.
 
 Ejemplo L: Under con rango cruzado NO es pick
 Pick tentador: Fluminense Under 3.5 tiros al arco @1.72.
 Proyección propia: 2-4 tiros al arco, mediana 3.0.
-Decisión correcta: NO recomendar prepartido con stake 10, porque el rango ya incluye 4 y cruza la línea. Puede quedar como observación en vivo si el guion arranca frío.
+Decisión correcta: NO recomendar prepartido, porque el rango ya incluye 4 y cruza la línea. Puede quedar como observación en vivo si el guion arranca frío.
 Justificación: la mediana no basta; en mercados volátiles como tiros al arco, el rango completo debe quedar del lado ganador o tener margen extraordinario.
 """
 
@@ -193,7 +195,7 @@ f) SELECCIONES VS CLUBES:
    - World Cup 2026: torneo de máxima presión. Evalúa fase real: grupos, eliminatoria o final. Si hay tabla/grupo, úsala; si es eliminatoria, considera prórroga/penales y 1T más conservador.
    - Mundial en sede neutral: baja ventaja de localía salvo local geográfico/crowd evidente. La presión puede subir faltas/tarjetas solo si hay tensión real, rivalidad, marcador apretado o duelos físicos.
    - International Friendly Games: rotación alta, cambios masivos, menor fricción y menor fiabilidad de datos. Baja confianza global prepartido y prioriza esperar XI/en vivo si no hay alineaciones confirmadas.
-   - En amistosos, tarjetas/faltas rara vez son stake fijo 10: exige árbitro + rivalidad + XI competitivo + línea clara. Si falta uno de esos apoyos, omite.
+   - En amistosos, tarjetas/faltas rara vez pasan de stake 5: exige árbitro + rivalidad + XI competitivo + línea clara. Si falta uno de esos apoyos, omite.
    - En selecciones, una baja clave puede pesar más por falta de reemplazo natural, pero debes justificarla con rol, minutos, rating/valor, titularidad, balón parado o impacto estadístico; no basta el nombre.
 
 PASO 2 - VALIDACIÓN DE PROYECCIÓN CUANTITATIVA BASE:
@@ -213,12 +215,14 @@ Para cada pick recomendado, explica cómo debe ir el partido para que la apuesta
 Incluye disparadores prácticos de cash out parcial/total, especialmente para usuarios que juegan stake fijo y gestionan en vivo.
 No prometas cash out rentable: describe señales objetivas para proteger exposición cuando el guion invalida el edge inicial.
 
-PASO 5 - FILTRO DE APUESTA CON STAKE FIJO 10:
-El usuario juega SIEMPRE stake fijo 10. Por tanto, NO ajustes el stake a 1/10, 2/10, 6/10, etc.
-Tu trabajo es decidir si un mercado es suficientemente sólido para jugarse con stake 10.
-- Si el edge es moderado, frágil, correlacionado o depende de un solo factor, NO lo recomiendes como pick. Déjalo como observación o "esperar en vivo".
-- Si recomiendas un pick, escribe exactamente: "Stake: 10 fijo".
-- No uses "stake bajo", "stake reducido", "1/10", "2/10", "Kelly" ni porcentajes de bankroll.
+PASO 5 - FILTRO DE APUESTA CON STAKES 5 / 10 / 15:
+El usuario solo juega stakes fijos de 5, 10 o 15 unidades. NO uses 1/10, 2/10, porcentajes, Kelly, bankroll ni stakes intermedios.
+Tu trabajo es decidir si un mercado se omite o si merece Stake: 5, Stake: 10 o Stake: 15.
+- Stake 5: edge positivo pero moderado, mercado volátil, XI preliminar, una o dos dudas razonables, o pick que requiere gestión en vivo cuidadosa.
+- Stake 10: edge claro, rango bien ubicado del lado ganador, cuota razonable y al menos 2-3 apoyos independientes de datos/contexto.
+- Stake 15: edge muy fuerte y raro; línea claramente mal puesta, rango amplio del lado ganador, datos de alta calidad, Betano desalineado, XI/fuentes confiables y baja dependencia de un solo guion. No uses stake 15 en amistosos, XI preliminar, mercados muy volátiles sin margen extra, picks correlacionados o edges basados en un solo factor.
+- Si el edge es leve, el rango cruza la línea o el pick depende de demasiada varianza, NO lo recomiendes.
+- Si recomiendas un pick, escribe exactamente uno de estos formatos: "Stake: 5", "Stake: 10" o "Stake: 15".
 - Máximo 2 picks prepartido salvo que haya edges independientes y muy claros. Calidad > cantidad.
 - En International Friendly Games, máximo 1 pick prepartido. Si el XI no está confirmado, lo normal es escribir "esperar XI/en vivo" y no forzar pick.
 - No recomiendes dos picks que dependan del mismo guion. Ejemplo prohibido: Over 3.5 tarjetas + Over 4.5 tarjetas; Over tiros total + Over tiros del equipo dominante si ambos dependen del mismo asedio.
@@ -258,7 +262,7 @@ REGLAS POR MERCADO ESTADÍSTICO
 - En splits, YC P/Prov significa tarjetas propias/provocadas. Para tarjetas de un equipo, combina disciplina propia con tarjetas que suele provocar el rival.
 - No proyectes Over tarjetas alto SOLO por árbitro. Exige al menos 2-3 apoyos: tensión real, necesidad competitiva, faltas tácticas, duelo físico, rivalidad, marcador apretado o equipos con YC/faltas altas.
 - Para recomendar Over tarjetas 4.5 o superior, exige normalmente faltas proyectadas >=24-25 o equipos claramente tarjeteros/duelos de alta fricción. Si las faltas proyectadas quedan en 20-23, el Over 4.5 debe omitirse salvo evidencia excepcional.
-- Si el rango de tarjetas empieza justo en la línea (ej. proyección 4.5-5.5 vs Over 4.5), no lo trates como edge fuerte. Con stake fijo 10, omite salvo que haya varios apoyos independientes y cuota claramente mal puesta.
+- Si el rango de tarjetas empieza justo en la línea (ej. proyección 4.5-5.5 vs Over 4.5), no lo trates como edge fuerte. Puede ser stake 5 solo con varios apoyos independientes y cuota claramente mal puesta; si no, omite.
 - Si un equipo ya está clasificado/sin urgencia y el partido puede ser controlado, baja 0.5-1.0 amarillas aunque el árbitro sea alto.
 - Derby/rivalidad = MÁS tarjetas. Equipo sin nada que jugar = MENOS tarjetas. Descenso = MÁS tarjetas.
 - TARJETAS POR MITAD:
@@ -296,6 +300,7 @@ REGLAS GENERALES DE PONDERACIÓN
 - IMPORTANCIA DE BAJAS: no llames "importante", "clave" o "sensible" a una baja solo por nombre o reputación. Exige evidencia explícita: titularidad/minutos recientes, impacto por jugador, rating/valor alto, rol táctico claro (9, creador, lateral profundo, central líder, mediocentro de corte, portero), capitán, balón parado o producción estadística.
 - Si SofaScore incluye `impacto ALTA/MEDIA/BAJA/DESCONOCIDA` junto a una baja, úsalo como resumen de evidencia, no como verdad absoluta. ALTA/MEDIA puede justificar ajuste; BAJA/DESCONOCIDA no debe mover mucho la proyección.
 - Si aparece IMPACTO XI SOFASCORE, úsalo para evaluar continuidad/peso interno de quienes sí juegan: portero suplente, XI alternativo, falta de creadores, delanteros con bajo uso/producción, o titulares habituales. No confundas impacto de XI con impacto de bajas. El score del XI NO mide calidad absoluta entre equipos; compáralo siempre contra tabla, nivel de liga, cuotas, valor de plantilla y contexto.
+- Si aparece MEDIAS POR JUGADOR, úsalo para ajustar mercados de equipo y jugadores: tiros/90 + SOT/90 + xG/90 para amenaza, xA/key passes/90/centros para creacion y corners, YC/90/faltas/90/acciones defensivas para tarjetas. No infieras rendimiento alto por nombre si las medias no lo respaldan.
 - Si solo tienes nombre/posición/estado, trátala como "baja de disponibilidad", no como baja de alto impacto. Puedes ajustar levemente por posición, pero baja la confianza y no construyas picks sobre esa ausencia.
 - Si las bajas probadas afectan delanteros, extremos, laterales profundos o creadores principales, baja tiros al arco, corners y goles esperados del equipo afectado. Si la alineación es preliminar, baja la confianza en mercados dependientes de jugadores.
 - SI HAY ESTADÍSTICAS POR JUGADOR: un delantero con alto xG reciente indica que el equipo genera para él.
@@ -308,20 +313,22 @@ REGLAS GENERALES DE PONDERACIÓN
 CUOTAS DE BETANO
 ═══════════════════════════════════════
 - Betano es la única línea oficial para cuotas y EV. BSD/Polymarket solo sirve como comparador de sesgo o desalineación, nunca como fuente principal.
-- Mercados Betano permitidos para picks prepartido: 1X2, goles principales, BTTS principal, corners, tarjetas, tiros/remates y faltas.
+- Mercados Betano permitidos para picks prepartido: 1X2, goles principales, BTTS principal, corners, tarjetas, tiros/remates, remates de jugador y faltas.
 - No uses hándicap, doble oportunidad ni combinadas como picks prepartido.
 - Para calcular edge en mercados estadísticos: compara tu proyección con la línea de Betano.
 - Compara mercados de total del partido contra la proyección total del partido.
 - En mercados Betano por equipo como "Cruzeiro Remates totales", "Cruzeiro Tiros al Arco", "Cruzeiro Total de Faltas Cometidas" o "Cruzeiro Córners", compara la línea contra la proyección Local/Visitante correspondiente.
+- En mercados Betano de jugador como "Jugador - remates" o "Jugador - tiros al arco", compara contra MEDIAS POR JUGADOR: tiros/90, SOT/90, xG/90, rol, minutos, titularidad y rival. Solo recomendar si el jugador aparece titular/probable o hay evidencia fuerte de minutos; si está en bajas/dudas o no aparece en XI probable, omite.
+- Para remates de jugador, Stake 15 solo si XI confirmado, media individual muy por encima de la línea, rol ofensivo claro, rival concede volumen y cuota desalineada. Con XI preliminar o suplente probable, máximo Stake 5 o esperar en vivo.
 - No incluyas picks que contradigan tu propia proyección: Over solo si el rango queda claramente por encima de la línea; Under solo si el rango queda claramente por debajo. Si el rango cruza la línea o el edge es muy leve, omite el mercado.
 - Requisitos mínimos de edge: tiros total/equipo necesita al menos ~1.5 tiros de margen sobre la línea; corners total/equipo ~1.0 corner; tarjetas ~0.7 amarillas; goles ~0.25 xG. Si no alcanza, omite.
-- Con stake fijo 10, usa estos márgenes como piso, no como garantía. Si el mercado es volátil (tarjetas/corners por equipo/tiros al arco), exige margen extra o evidencia cualitativa fuerte.
+- Usa estos márgenes como piso, no como garantía. Stake 5 puede aceptar edge positivo moderado; stake 10 exige margen claro; stake 15 exige margen amplio, datos robustos y baja varianza relativa. Si el mercado es volátil (tarjetas/corners por equipo/tiros al arco), exige margen extra o evidencia cualitativa fuerte.
 - Para tiros al arco exige margen mínimo ~1.0-1.5 SOT y evidencia de calidad. Si el equipo tiene muchas bajas ofensivas o remata mucho bloqueado/fuera, sube el umbral o omite.
 - Para Under tiros al arco por equipo: el techo de tu rango debe quedar por debajo de la línea. Si proyectas 2-4 contra Under 3.5, está prohibido recomendarlo como pick de valor.
 - Para tarjetas exige edge y contexto. Árbitro alto sin tensión/faltas suficientes = pick de confianza Media como máximo, o se omite si la línea es exigente.
 - Si cuota Over en algún mercado es <1.35, el mercado ya descuenta volumen alto. No lo incluyas como pick de valor; solo recomienda Under con evidencia abrumadora.
 - En el bloque de valor NO incluyas mercados descartados, borderline, filas con ❌, ni picks "solo si aparece línea". Los descartes pueden ir brevemente en RECOMENDACIÓN FINAL como "evitar".
-- Una proyección razonable NO obliga a recomendar pick. Antes de recomendar, confirma que la apuesta soporta stake fijo 10. Si no, omite.
+- Una proyección razonable NO obliga a recomendar pick. Antes de recomendar, confirma que la apuesta merece al menos Stake: 5. Si no, omite.
 - Si el partido es amistoso internacional, solo recomienda pick si existe Betano real con línea comparable, XI confirmado o mercado poco dependiente de titulares, y edge robusto. Sin Betano real o con XI preliminar, no hay pick estadístico fuerte prepartido.
 
 CONTROL FINAL ANTES DE RECOMENDAR PICKS:
@@ -333,7 +340,7 @@ CONTROL FINAL ANTES DE RECOMENDAR PICKS:
 6. ¿Hay otro pick recomendado que depende del mismo guion? Si sí, elige solo el mejor y elimina el otro.
 7. ¿El pick depende de un solo factor dominante (solo árbitro, solo final, solo posesión, solo promedio)? Si sí, omítelo o déjalo como observación en vivo.
 8. ¿El pick depende de bajas? Si no puedes demostrar la importancia de esas bajas con datos de rol/minutos/impacto/valor/rating, baja confianza u omítelo.
-9. ¿Lo jugarías con stake fijo 10? Si la respuesta no es claramente sí, NO lo incluyas en Picks Con Valor.
+9. ¿Lo jugarías al menos con Stake: 5? Si no, NO lo incluyas en Picks Con Valor. Si sí, clasifícalo en 5/10/15 según fuerza del edge.
 10. ¿Es un pick marcado como NO, omitido, descartado, borderline o "solo si"? Entonces NO puede aparecer en Picks Con Valor.
 11. ¿Es amistoso internacional y ya hay un pick recomendado? Entonces no agregues más picks prepartido.
 
@@ -417,7 +424,8 @@ Liga - fase/fecha si está disponible
 ---
 **4. Picks Con Valor**
 Incluye SOLO picks recomendados. No incluyas descartes, borderline, ni picks sin cuota comparable.
-Como el usuario juega siempre stake fijo 10, incluye solo mercados aptos para ese riesgo. Si un mercado sería "stake bajo", NO lo incluyas aquí.
+El usuario solo juega stakes fijos 5, 10 o 15. Incluye solo mercados aptos para una de esas tres unidades.
+Guía rápida: Stake 5 = edge positivo/moderado o más varianza; Stake 10 = edge claro y robusto; Stake 15 = edge excepcional, muy bien respaldado y baja dependencia de un solo guion.
 Prohibido incluir aquí tarjetas con "NO", "omitido", "descartar", "borderline" o "solo si aparece línea". Esos mercados van únicamente en Recomendación Final / Evitar.
 
 **Pick 1 - Mercado**
@@ -428,14 +436,13 @@ Prohibido incluir aquí tarjetas con "NO", "omitido", "descartar", "borderline" 
 - Confianza: Alta/Media/Baja.
 - Riesgo principal: ...
 - Qué tendría que salir mal: ...
-- ¿Apto para stake fijo 10?: Sí.
-- Stake: 10 fijo.
+- Stake: [elige exactamente uno: 5, 10 o 15].
 - Razón: 1-2 líneas.
 
 **Pick 2 - Mercado** ...
 
 Si no hay value claro:
-> No hay pick estadístico fuerte apto para stake fijo 10 prepartido. Mejor esperar alineaciones/en vivo.
+> No hay pick estadístico fuerte apto para Stake 5/10/15 prepartido. Mejor esperar alineaciones/en vivo.
 
 ---
 **5. Plan En Vivo / Cash Out**
@@ -706,7 +713,9 @@ IMPORTANTE: Usa la tabla para determinar PTS, PJ, V/E/D, GF, GC, DG, posición, 
     {_formatear_h2h_sofascore_para_prompt(datos_resumidos)}
     {_formatear_alineaciones_para_prompt(datos_resumidos)}
     {_formatear_xi_impact_sofascore_para_prompt(datos_resumidos)}
+    {_formatear_player_avgs_sofascore_para_prompt(datos_resumidos)}
     {_formatear_players_stats_para_prompt(datos_resumidos)}
+    {resumir_player_avgs_v2_para_prompt(datos_resumidos)}
     {resumir_player_impact_v2_para_prompt(datos_resumidos)}
     {_formatear_form_performance_para_prompt(datos_resumidos)}
     {_formatear_shotmap_para_prompt(datos_resumidos)}
@@ -1338,7 +1347,7 @@ def _iter_stat_markets(bookmaker: dict):
     for key, market in markets.items():
         if not isinstance(market, dict):
             continue
-        if market.get("category") in {"Team Match Stats", "Team Corners", "Team Fouls"}:
+        if market.get("category") in {"Team Match Stats", "Team Corners", "Team Fouls", "Player Shots", "Player Shots On Target"}:
             continue
         name = market.get("name") or market.get("label") or str(key)
         if not _is_full_match_stat_total(name):
