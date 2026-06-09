@@ -213,11 +213,3 @@ En PowerShell, si quieres reiniciar el bot y evitar procesos duplicados:
 Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'python|py' -and $_.CommandLine -match 'bot.py' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 Start-Process -FilePath python -ArgumentList '.\bot.py' -WorkingDirectory 'D:\Projects\NuevoAgenIa\betting-ai' -WindowStyle Hidden
 ```
-
-## Seguridad
-
-- No subas `.env`.
-- Usa `.env.example` solo con placeholders.
-- Si alguna API key se imprime o se comparte por error, rotala.
-- `output/` contiene datos locales y esta ignorado por git.
-- `README.local.md` queda reservado para notas internas de trabajo y no se publica.
